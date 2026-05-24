@@ -1693,6 +1693,167 @@ async def repair_if_bad(item: dict, candidate: str) -> str:
 
 
 # ============================================================
+# Cross-run Consensus（跨运行答案投票 + 锁定 + 跳过）
+# ============================================================
+# 思路：每次脚本启动都会跑出一份 submit.jsonl。我们把历史每次跑的结果
+# 累计到 consensus_state.json；如果同一 id 在历史中有 >=N 次"归一化相等"
+# 的答案，就把它锁定（locked_answer），下次启动直接复用、跳过 API 调用，
+# 既省 token 又能用 wisdom-of-crowds 滤除随机抖动。
+# 输出：
+#   - submit.jsonl          —— 本次运行的完整答案（包含锁定 + 新生成）
+#   - consensus_final.jsonl —— 仅锁定的答案（用于最终提交）
+#   - runs/run_<TS>_<P>.jsonl —— 历史每次提交的归档
+#   - consensus_state.json  —— 历史 + 锁定状态
+ENABLE_CONSENSUS = os.environ.get("ENABLE_CONSENSUS", "true").lower() == "true"
+RESET_CONSENSUS = os.environ.get("RESET_CONSENSUS", "false").lower() == "true"
+CONSENSUS_LOCK_AT = int(os.environ.get("CONSENSUS_LOCK_AT", "2"))  # 多少次相同就锁定
+CONSENSUS_STATE_FILE = "consensus_state.json"
+CONSENSUS_FINAL_FILE = "consensus_final.jsonl"
+CONSENSUS_RUNS_DIR = "runs"
+
+
+def _consensus_norm(answer: str, atype: AnswerType) -> str:
+    """归一化用于比较的 key。先 coerce 再 normalize。"""
+    if answer is None:
+        return ""
+    coerced = coerce_answer(answer, atype)
+    return normalize_text(coerced)
+
+
+def load_consensus_state() -> dict:
+    if RESET_CONSENSUS or not os.path.exists(CONSENSUS_STATE_FILE):
+        return {}
+    try:
+        with open(CONSENSUS_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[consensus] state load failed ({e}); 重新开始")
+        return {}
+
+
+def save_consensus_state(state: dict) -> None:
+    tmp = CONSENSUS_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONSENSUS_STATE_FILE)
+
+
+def archive_previous_submit() -> str | None:
+    """把上一次的 submit.jsonl + submit_raw.jsonl 归档到 runs/。"""
+    if not os.path.exists(OUTPUT_FILE) and not os.path.exists(RAW_OUTPUT_FILE):
+        return None
+    os.makedirs(CONSENSUS_RUNS_DIR, exist_ok=True)
+    import time
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    provider_tag = LLM_PROVIDER
+    archived_path = None
+    if os.path.exists(OUTPUT_FILE):
+        archived_path = os.path.join(
+            CONSENSUS_RUNS_DIR, f"submit_{ts}_{provider_tag}.jsonl",
+        )
+        os.replace(OUTPUT_FILE, archived_path)
+        print(f"[consensus] archived {OUTPUT_FILE} -> {archived_path}")
+    if os.path.exists(RAW_OUTPUT_FILE):
+        raw_archived = os.path.join(
+            CONSENSUS_RUNS_DIR, f"submit_raw_{ts}_{provider_tag}.jsonl",
+        )
+        os.replace(RAW_OUTPUT_FILE, raw_archived)
+        print(f"[consensus] archived {RAW_OUTPUT_FILE} -> {raw_archived}")
+    return archived_path
+
+
+def ingest_run_into_state(state: dict, run_file: str, data: list) -> int:
+    """把一次运行结果合并入 state；返回新增条目数。"""
+    if not os.path.exists(run_file):
+        return 0
+    by_id: dict[int, str] = {}
+    with open(run_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in obj and isinstance(obj.get("answer", ""), str):
+                by_id[obj["id"]] = obj["answer"].strip()
+    item_by_id = {d["id"]: d for d in data}
+    added = 0
+    for iid, ans in by_id.items():
+        if not ans:
+            continue
+        item = item_by_id.get(iid)
+        if item is None:
+            continue
+        atype = detect_answer_type(item["question"])
+        record_answer_to_state(state, iid, ans, atype, persist=False)
+        added += 1
+    return added
+
+
+def record_answer_to_state(
+    state: dict,
+    item_id: int,
+    answer: str,
+    atype: AnswerType,
+    persist: bool = True,
+) -> bool:
+    """把一次答案加入历史，并在达到阈值时锁定。返回 True 表示发生了新锁定。"""
+    if not answer:
+        return False
+    key = str(item_id)
+    entry = state.setdefault(key, {"history": [], "locked": False, "locked_answer": ""})
+    if entry.get("locked"):
+        return False
+    norm = _consensus_norm(answer, atype)
+    if not norm:
+        return False
+    entry["history"].append({"raw": answer, "norm": norm})
+    counts: Counter = Counter(h["norm"] for h in entry["history"] if h.get("norm"))
+    if not counts:
+        return False
+    most_norm, cnt = counts.most_common(1)[0]
+    newly_locked = False
+    if cnt >= CONSENSUS_LOCK_AT:
+        matches = [h["raw"] for h in entry["history"] if h.get("norm") == most_norm]
+        entry["locked_answer"] = max(matches, key=len)
+        entry["locked"] = True
+        newly_locked = True
+    if persist:
+        save_consensus_state(state)
+    return newly_locked
+
+
+def get_locked_answer(state: dict, item_id: int) -> str | None:
+    entry = state.get(str(item_id))
+    if entry and entry.get("locked"):
+        return entry.get("locked_answer") or None
+    return None
+
+
+def write_consensus_final(state: dict, data: list) -> tuple[int, int]:
+    """写出 consensus_final.jsonl，仅包含锁定项；未锁定的 answer 留空。"""
+    locked = 0
+    total = 0
+    with open(CONSENSUS_FINAL_FILE, "w", encoding="utf-8") as f:
+        for item in sorted(data, key=lambda x: x["id"]):
+            total += 1
+            ans = get_locked_answer(state, item["id"])
+            if ans:
+                locked += 1
+            f.write(json.dumps({"id": item["id"], "answer": ans or ""}, ensure_ascii=False) + "\n")
+    return locked, total
+
+
+def print_consensus_summary(state: dict, data: list) -> None:
+    locked = sum(1 for d in data if get_locked_answer(state, d["id"]))
+    one_run = sum(1 for d in data if not get_locked_answer(state, d["id"]) and len((state.get(str(d["id"])) or {}).get("history", [])) == 1)
+    disagreeing = sum(1 for d in data if not get_locked_answer(state, d["id"]) and len((state.get(str(d["id"])) or {}).get("history", [])) >= 2)
+    print(f"[consensus] 锁定 {locked}/{len(data)}  |  单次答 {one_run}  |  多次分歧 {disagreeing}  |  阈值 ={CONSENSUS_LOCK_AT}")
+
+
+# ============================================================
 # 主流程
 # ============================================================
 def load_done_ids(path: str) -> set:
@@ -1759,7 +1920,7 @@ async def solve_item(item: dict) -> str:
     return candidate
 
 
-async def worker(sem, item, out_lock, out_file, counter, total):
+async def worker(sem, item, out_lock, out_file, counter, total, consensus_state=None):
     async with sem:
         try:
             answer = await solve_item(item)
@@ -1774,6 +1935,12 @@ async def worker(sem, item, out_lock, out_file, counter, total):
             ans_preview = (answer[:60] + "...") if len(answer) > 60 else answer
             print(f"[{counter['done']:3d}/{total}] id={item['id']:3d} {item['task_type']:16s} | Q: {preview}")
             print(f"            -> {ans_preview!r}")
+            # 共识状态更新（同样在锁内，避免并发写文件冲突）
+            if consensus_state is not None and answer:
+                atype = detect_answer_type(item["question"])
+                if record_answer_to_state(consensus_state, item["id"], answer, atype, persist=True):
+                    print(f"            *** consensus LOCKED for id={item['id']} -> "
+                          f"{consensus_state[str(item['id'])]['locked_answer'][:60]!r}")
 
 
 async def main():
@@ -1789,6 +1956,7 @@ async def main():
         print(f"  reasoning_effort={OPENAI_REASONING_EFFORT}  verbosity={OPENAI_VERBOSITY}  deepseek_thinking={OPENAI_ENABLE_DEEPSEEK_THINKING}")
     print(f"  VOTING_ROUNDS:   {VOTING_ROUNDS_BY_TYPE}")
     print(f"  KG_SUBGRAPH={ENABLE_KG_SUBGRAPH}  PASSAGE_RANK={ENABLE_PASSAGE_RANK}  VERIFY={ENABLE_VERIFICATION}  REPAIR={ENABLE_REPAIR}")
+    print(f"  CONSENSUS={ENABLE_CONSENSUS}  lock_at={CONSENSUS_LOCK_AT}  reset={RESET_CONSENSUS}")
     print("=" * 60)
 
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
@@ -1800,18 +1968,46 @@ async def main():
     for t, c in type_counts.items():
         print(f"  - {t}: {c}")
 
-    answers = load_answers(RAW_OUTPUT_FILE)
-    if not answers and os.path.exists(OUTPUT_FILE):
-        answers = load_answers(OUTPUT_FILE)
+    # —— Cross-run consensus 准备 ——
+    consensus_state: dict = {}
+    if ENABLE_CONSENSUS:
+        consensus_state = load_consensus_state()
+        # 把上次的 submit.jsonl 合并入状态（如果存在）然后归档
+        if os.path.exists(OUTPUT_FILE):
+            ingested = ingest_run_into_state(consensus_state, OUTPUT_FILE, data)
+            print(f"[consensus] 将上次 submit.jsonl 的 {ingested} 条答案纳入历史")
+            save_consensus_state(consensus_state)
+        archive_previous_submit()
+        print_consensus_summary(consensus_state, data)
+
+    answers: dict = {}
+    if ENABLE_CONSENSUS:
+        # 预填锁定答案
+        for item in data:
+            la = get_locked_answer(consensus_state, item["id"])
+            if la:
+                answers[item["id"]] = la
+        if answers:
+            print(f"[consensus] 跳过 {len(answers)} 个已锁定题（直接复用 locked_answer，零 API 调用）")
+    # submit_raw.jsonl 已被归档；intra-run resume 因此重新开始（也可以用 ENABLE_CONSENSUS=false 保留旧逻辑）
 
     deterministic_count = 0
     for item in data:
         if item["task_type"] != "table_qa":
             continue
+        # 锁定的不覆盖
+        if item["id"] in answers:
+            continue
         answer = solve_table_qa(item)
         if answer is not None:
             answers[item["id"]] = answer
             deterministic_count += 1
+            # 把确定性结果也喂给共识，加速锁定
+            if ENABLE_CONSENSUS:
+                atype = detect_answer_type(item["question"])
+                record_answer_to_state(consensus_state, item["id"], answer, atype, persist=False)
+    if ENABLE_CONSENSUS:
+        save_consensus_state(consensus_state)
 
     done_ids = {
         item["id"]
@@ -1822,27 +2018,32 @@ async def main():
     print(f"已完成: {len(done_ids)}  |  待答: {len(todo)}  |  并发: {CONCURRENCY}")
     print(f"表格确定性求解覆盖: {deterministic_count}")
 
-    if not todo:
-        write_submit(OUTPUT_FILE, data, answers)
-        print(f"全部完成，已重写去重提交 -> {OUTPUT_FILE}")
-        return
+    if todo:
+        sem = asyncio.Semaphore(CONCURRENCY)
+        out_lock = asyncio.Lock()
+        counter = {"done": 0}
+        with open(RAW_OUTPUT_FILE, "a", encoding="utf-8") as out_file:
+            tasks = [
+                worker(sem, item, out_lock, out_file, counter, len(todo),
+                       consensus_state if ENABLE_CONSENSUS else None)
+                for item in todo
+            ]
+            await asyncio.gather(*tasks)
 
-    sem = asyncio.Semaphore(CONCURRENCY)
-    out_lock = asyncio.Lock()
-    counter = {"done": 0}
-
-    with open(RAW_OUTPUT_FILE, "a", encoding="utf-8") as out_file:
-        tasks = [worker(sem, item, out_lock, out_file, counter, len(todo)) for item in todo]
-        await asyncio.gather(*tasks)
-
-    answers.update(load_answers(RAW_OUTPUT_FILE))
-    for item in data:
-        if item["task_type"] == "table_qa":
-            answer = solve_table_qa(item)
-            if answer is not None:
-                answers[item["id"]] = answer
+        answers.update(load_answers(RAW_OUTPUT_FILE))
+        for item in data:
+            if item["task_type"] == "table_qa":
+                answer = solve_table_qa(item)
+                if answer is not None:
+                    answers[item["id"]] = answer
 
     write_submit(OUTPUT_FILE, data, answers)
+
+    if ENABLE_CONSENSUS:
+        save_consensus_state(consensus_state)
+        locked, total = write_consensus_final(consensus_state, data)
+        print(f"\n[consensus] consensus_final.jsonl: 锁定 {locked}/{total}")
+        print_consensus_summary(consensus_state, data)
 
     final_done = load_done_ids(OUTPUT_FILE)
     print(f"\n写入完成: {len(final_done)}/{total_all}")

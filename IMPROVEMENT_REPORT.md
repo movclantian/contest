@@ -182,7 +182,68 @@ LLM_PROVIDER=openai    python3 test.py   # 改走 OpenAI SDK
 
 ---
 
-## 8. 后续可选 (Out-of-scope 本 PR)
+## 8. Cross-run Consensus（跨运行答案锁定 + 跳过）
+
+来源：用户提案。
+
+### 8.1 思路
+
+每次脚本启动都会跑出一份 `submit.jsonl`。把每次的结果累计到 `consensus_state.json`：
+- 同一 `id` 在历史中有 **>=N 次"归一化相等"** 的答案 → 锁定
+- 下次启动时，**已锁定的题直接复用 locked_answer**，跳过 KG 子图 / BM25 / 5 路投票 / verifier / repair 全部 API 调用
+- 用户每次仍能拿到完整的 `submit.jsonl` 用于提交；同时输出 `consensus_final.jsonl` 作为"高置信度"提交候选
+
+收益：
+- **省 token**：第 2 次起，已锁定题不再调用 API；随迭代次数指数级减少 API 量
+- **省时间**：跳过的题瞬间完成
+- **降抖动**：把同一题的多次运行视作 ensemble，过滤偶然性误差
+- **加置信度**：locked_answer 至少经过 N 次独立运行的相互验证
+
+### 8.2 实现
+
+| 文件 / 配置 | 含义 |
+| ---- | ---- |
+| `consensus_state.json` | 每个 id 的历史答案 + 归一化 + 是否锁定 |
+| `consensus_final.jsonl` | 仅含已锁定项的 final submission 候选 |
+| `runs/submit_<TS>_<provider>.jsonl` | 每次启动前的存档 |
+| env `ENABLE_CONSENSUS=true/false` | 总开关（默认开） |
+| env `CONSENSUS_LOCK_AT=2` | 多少次相同归一化即锁定（默认 2） |
+| env `RESET_CONSENSUS=true` | 清空历史重新开始（默认 false） |
+
+锁定算法：
+```
+norm = normalize_text(coerce_answer(answer, atype))
+counter[norm] += 1
+if counter.most_common(1)[0][1] >= LOCK_AT:
+    locked_answer = 历史中归一化匹配最长的原始答案
+    locked = True
+```
+
+### 8.3 工作流
+
+```bash
+# 第 1 次
+python3 test.py            # 全量调 API → submit.jsonl  + 历史[1]
+
+# 第 2 次（用户修改 prompt / 参数后再跑）
+python3 test.py            # 跳过上次确定相同的题；新跑可能"锁定"一批；其它继续
+
+# 第 3 次、第 4 次...
+python3 test.py            # 锁定数单调递增；API 调用单调递减
+
+# 直到 consensus_final.jsonl 锁定数 ≈ 250 ⇒ 提交它作为"最终"答案
+```
+
+### 8.4 边界处理
+
+- **算法升级后想全部重跑**：`RESET_CONSENSUS=true python3 test.py`
+- **临时关闭共识**（调试单次行为）：`ENABLE_CONSENSUS=false python3 test.py`
+- **不同 provider 切换时**：归一化只看答案内容，与 provider 无关；用 Anthropic 跑两次 + OpenAI 跑两次的答案同样能匹配锁定
+- **表格确定性 solver**：每次都跑，因为它确定且零 token，喂入 consensus 后通常 2 次后就全锁定
+
+---
+
+## 9. 后续可选 (Out-of-scope 本 PR)
 
 - **Pandas 沙盒**：让 LLM 输出 pandas 表达式 → 安全 ast 评估（高 ROI 但代码复杂度大）。
 - **Few-shot exemplar**：从 250 题中挑 3 题作为 in-context demo（需要观察实际错例）。
