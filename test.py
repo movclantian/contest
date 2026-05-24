@@ -9,14 +9,14 @@ CCKS 2026 OneEval 解题脚本（DeepSeek V4 Pro + Think Max）  v2
 5. 类型感知答案后处理（count / year / entity / yes-no / list）
 6. 拒答兜底升温重答
 7. 双 Provider 支持：LLM_PROVIDER=anthropic 或 openai（互斥，单次只启用一种）
-   - anthropic：anthropic SDK + DeepSeek Anthropic-兼容端点（thinking + output_config.effort=max）
-   - openai   ：openai SDK + DeepSeek OpenAI-兼容端点 / 真正 OpenAI（reasoning_effort=max + verbosity=high）
+   - anthropic：anthropic SDK · messages.create + thinking={"type":"enabled","budget_tokens":N}
+                可对接 Claude Opus 4.7 官方端点，或任何 Anthropic-兼容反代
+   - openai   ：openai SDK · chat.completions.create + reasoning_effort
+                可对接 GPT-5.5 / GPT-5.4 / GLM-5 / GLM-5.1 / DeepSeek-OpenAI 等所有 OpenAI 兼容端点
+8. 跨运行 Consensus：见 IMPROVEMENT_REPORT.md §8（锁定 + 跳过）
 
-环境变量速查：
-  LLM_PROVIDER=anthropic|openai            # 默认 anthropic
-  ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL / ANTHROPIC_OUTPUT_EFFORT
-  OPENAI_API_KEY    / OPENAI_BASE_URL    / OPENAI_MODEL    / OPENAI_REASONING_EFFORT
-  OPENAI_VERBOSITY / OPENAI_USE_RESPONSES_API / OPENAI_ENABLE_DEEPSEEK_THINKING
+配置点：直接编辑 test.py 顶部的常量（LLM_PROVIDER / *_API_KEY / *_BASE_URL / *_MODEL ...）。
+不使用环境变量。
 """
 
 from __future__ import annotations
@@ -37,56 +37,34 @@ from rapidfuzz import fuzz
 # 配置区
 # ============================================================
 # 【Provider 开关】只能选一个："anthropic" | "openai"
-#   - "anthropic"：使用 anthropic SDK 访问 DeepSeek 官方的 Anthropic-兼容端点
-#   - "openai"  ：使用 openai     SDK，可指向 DeepSeek OpenAI 端点或真正的 OpenAI
-#                  (如 gpt-5 系列，此时 OPENAI_USE_RESPONSES_API=True)
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower().strip()
+#   anthropic SDK：Claude 系列（Opus/Sonnet 等）官方 API，或任何 Anthropic-兼容端点
+#   openai    SDK：GPT-5.x / GLM-5.x / DeepSeek-OpenAI 等所有 OpenAI 兼容端点
+LLM_PROVIDER = "anthropic"   # "anthropic" 或 "openai"
 
-# ---------- Anthropic-flavored config (DeepSeek's Anthropic-compatible endpoint) ----------
-ANTHROPIC_API_KEY = os.environ.get(
-    "ANTHROPIC_API_KEY",
-    os.environ.get("DEEPSEEK_API_KEY", "sk-3b8f9bf9a89c4633a36cc7109ef2026f"),
-)
-ANTHROPIC_BASE_URL = os.environ.get(
-    "ANTHROPIC_BASE_URL",
-    "https://api.deepseek.com/anthropic",
-)
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-pro")
-# DeepSeek 【Anthropic 格式】的 effort 控制。拉满 = "max"
-ANTHROPIC_OUTPUT_EFFORT = os.environ.get("ANTHROPIC_OUTPUT_EFFORT", "max")  # "high" | "max"
+# ---------- Anthropic SDK（Claude Opus 4.7 等） ----------
+ANTHROPIC_API_KEY  = "sk-3b8f9bf9a89c4633a36cc7109ef2026f"
+ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"   # Claude 官方：https://api.anthropic.com
+ANTHROPIC_MODEL    = "deepseek-v4-pro"                       # Claude 官方：claude-opus-4-7-20250...
 
-# ---------- OpenAI-flavored config (DeepSeek OpenAI 兼容 或 真正的 OpenAI) ----------
-OPENAI_API_KEY = os.environ.get(
-    "OPENAI_API_KEY",
-    os.environ.get("DEEPSEEK_API_KEY", "sk-3b8f9bf9a89c4633a36cc7109ef2026f"),
-)
-OPENAI_BASE_URL = os.environ.get(
-    "OPENAI_BASE_URL",
-    "https://api.deepseek.com",  # DeepSeek OpenAI 兼容端点；真正 OpenAI 请留空或设成 https://api.openai.com/v1
-)
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "deepseek-v4-pro")
-# 【OpenAI 格式】 effort：DeepSeek 支持 high/max；真正 OpenAI 支持 minimal/low/medium/high
-OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "max")
-# 【仅真正 OpenAI / gpt-5 适用】verbosity：low/medium/high
-OPENAI_VERBOSITY = os.environ.get("OPENAI_VERBOSITY", "high")
-# 使用 OpenAI Responses API (gpt-5/o3/o1 等）；默认走 chat.completions（适配 DeepSeek）
-OPENAI_USE_RESPONSES_API = os.environ.get("OPENAI_USE_RESPONSES_API", "false").lower() == "true"
-# 是否启用 DeepSeek 的 thinking 扩展参数（仅 chat.completions 下生效）
-OPENAI_ENABLE_DEEPSEEK_THINKING = os.environ.get("OPENAI_ENABLE_DEEPSEEK_THINKING", "true").lower() == "true"
+# ---------- OpenAI SDK（GPT-5.5 / GLM-5 / GLM-5.1 等） ----------
+OPENAI_API_KEY  = "sk-3b8f9bf9a89c4633a36cc7109ef2026f"
+OPENAI_BASE_URL = "https://api.deepseek.com"                 # GPT  ：https://api.openai.com/v1
+                                                              # GLM  ：https://open.bigmodel.cn/api/paas/v4/
+OPENAI_MODEL    = "deepseek-v4-pro"                          # GPT  ：gpt-5.5 / gpt-5.4
+                                                              # GLM  ：glm-5 / glm-5.1
+OPENAI_REASONING_EFFORT = "high"                              # 推理力度，统一 high；OpenAI 还支持 minimal/low/medium
 
 INPUT_FILE = "contest_data.json"
 OUTPUT_FILE = "submit.jsonl"
 RAW_OUTPUT_FILE = "submit_raw.jsonl"
 
-# 按题型自适应 thinking_budget（OneEval：边际递减）—— 仅 Anthropic provider 使用
+# Anthropic extended-thinking 预算（按题型）；OpenAI SDK 用 reasoning_effort，无 budget 概念
 THINKING_BUDGET_BY_TYPE = {
     "knowledge_graph": 10000,
     "multi_hop_qa": 12000,
     "table_qa": 8000,
 }
-MAX_TOKENS = 16000
-TEMPERATURE = 0.3
-TOP_P = 0.9
+MAX_TOKENS = 16000   # Anthropic: max_tokens；OpenAI: max_completion_tokens
 
 CONCURRENCY = 80
 MAX_RETRIES = 5
@@ -111,9 +89,6 @@ PASSAGE_RANK_KEEP = 6
 
 ENABLE_VERIFICATION = True
 ENABLE_REPAIR = True
-
-VERIFY_TEMPERATURE = 0.2
-VERIFY_TOP_P = 0.8
 
 # ============================================================
 # Provider 客户端初始化（延迟）
@@ -1341,194 +1316,74 @@ def is_bad_answer(answer: str) -> bool:
     return any(pattern in text for pattern in BAD_ANSWER_PATTERNS)
 
 
-def extract_answer_from_anthropic(response) -> str:
-    for block in response.content:
-        if getattr(block, "type", None) == "text":
-            return clean_answer(block.text)
-    return ""
-
-
-def extract_answer_from_openai_chat(response) -> str:
-    """OpenAI Chat Completions 风格响应。"""
-    choices = getattr(response, "choices", None) or []
-    if not choices:
-        return ""
-    msg = choices[0].message
-    # 优先取 content；DeepSeek 思考链放在 reasoning_content（忽略）
-    content = getattr(msg, "content", None) or ""
-    return clean_answer(content)
-
-
-def extract_answer_from_openai_responses(response) -> str:
-    """OpenAI Responses API 风格响应（gpt-5）。"""
-    text = getattr(response, "output_text", None)
-    if text:
-        return clean_answer(text)
-    # 回退：遍历 output 字段
-    outputs = getattr(response, "output", None) or []
-    for o in outputs:
-        for c in (getattr(o, "content", None) or []):
-            t = getattr(c, "text", None)
-            if t:
-                return clean_answer(t)
-    return ""
-
-
 # ============================================================
-# API 调用：基础 + 多样性投票 + 验证
+# API 调用：单一入口，按 LLM_PROVIDER 走两套 SDK
 # ============================================================
-def _is_transient_openai_error(exc: Exception) -> tuple[bool, int | None]:
-    """判断是否为可重试错误。返回 (is_retryable, status_code)。"""
-    if _openai_mod is None:
+def _is_transient_error(exc: Exception) -> tuple[bool, int | None]:
+    """判断当前 provider 的异常是否可重试。返回 (是否重试, status_code)。"""
+    mod = _anthropic_mod if LLM_PROVIDER == "anthropic" else _openai_mod
+    if mod is None:
         return False, None
-    if isinstance(exc, getattr(_openai_mod, "RateLimitError", tuple())):
+    if isinstance(exc, getattr(mod, "RateLimitError", tuple())):
         return True, 429
     if isinstance(exc, (
-        getattr(_openai_mod, "APIConnectionError", tuple()),
-        getattr(_openai_mod, "APITimeoutError", tuple()),
+        getattr(mod, "APIConnectionError", tuple()),
+        getattr(mod, "APITimeoutError", tuple()),
     )):
         return True, None
-    if isinstance(exc, getattr(_openai_mod, "APIStatusError", tuple())):
+    if isinstance(exc, getattr(mod, "APIStatusError", tuple())):
         status = getattr(exc, "status_code", None)
-        if status and 500 <= status < 600:
-            return True, status
-        return False, status
+        return (bool(status and 500 <= status < 600), status)
     return False, None
-
-
-def _is_transient_anthropic_error(exc: Exception) -> tuple[bool, int | None]:
-    if _anthropic_mod is None:
-        return False, None
-    if isinstance(exc, getattr(_anthropic_mod, "RateLimitError", tuple())):
-        return True, 429
-    if isinstance(exc, (
-        getattr(_anthropic_mod, "APIConnectionError", tuple()),
-        getattr(_anthropic_mod, "APITimeoutError", tuple()),
-    )):
-        return True, None
-    if isinstance(exc, getattr(_anthropic_mod, "APIStatusError", tuple())):
-        status = getattr(exc, "status_code", None)
-        if status and 500 <= status < 600:
-            return True, status
-        return False, status
-    return False, None
-
-
-async def _call_anthropic_once(
-    prompt: str,
-    item_id: int,
-    temperature: float,
-    top_p: float,
-    thinking_budget: int,
-    label: str,
-) -> str:
-    client = _get_anthropic_client()
-    response = await client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=MAX_TOKENS,
-        temperature=temperature,
-        top_p=top_p,
-        thinking={"type": "enabled", "budget_tokens": thinking_budget},
-        output_config={"effort": ANTHROPIC_OUTPUT_EFFORT},
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return extract_answer_from_anthropic(response)
-
-
-async def _call_openai_chat_once(
-    prompt: str,
-    item_id: int,
-    temperature: float,
-    top_p: float,
-    label: str,
-) -> str:
-    """走 OpenAI Chat Completions 协议（DeepSeek OpenAI 端 / 真正 OpenAI 都可）。
-    DeepSeek 端：thinking={"type":"enabled"} via extra_body；reasoning_effort 通过原生字段或 extra_body。
-    """
-    client = _get_openai_client()
-    extra_body: dict[str, Any] = {}
-    if OPENAI_ENABLE_DEEPSEEK_THINKING:
-        extra_body["thinking"] = {"type": "enabled"}
-
-    create_kwargs: dict[str, Any] = {
-        "model": OPENAI_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": MAX_TOKENS,
-    }
-    # 注：thinking 模式下 temperature/top_p 被 DeepSeek 服务端忽略，但不会报错
-    create_kwargs["temperature"] = temperature
-    create_kwargs["top_p"] = top_p
-    # reasoning_effort：DeepSeek 接受 high/max；真正 OpenAI 接受 minimal/low/medium/high
-    try:
-        create_kwargs["reasoning_effort"] = OPENAI_REASONING_EFFORT
-    except Exception:
-        extra_body["reasoning_effort"] = OPENAI_REASONING_EFFORT
-    if extra_body:
-        create_kwargs["extra_body"] = extra_body
-    response = await client.chat.completions.create(**create_kwargs)
-    return extract_answer_from_openai_chat(response)
-
-
-async def _call_openai_responses_once(
-    prompt: str,
-    item_id: int,
-    temperature: float,
-    top_p: float,
-    label: str,
-) -> str:
-    """走 OpenAI Responses API（gpt-5/o3 等）。"""
-    client = _get_openai_client()
-    create_kwargs: dict[str, Any] = {
-        "model": OPENAI_MODEL,
-        "input": [{"role": "user", "content": prompt}],
-        "reasoning": {"effort": OPENAI_REASONING_EFFORT},
-        "text": {"verbosity": OPENAI_VERBOSITY},
-        "max_output_tokens": MAX_TOKENS,
-    }
-    # 推理模型通常不支持 temperature/top_p，所以这里不强加
-    response = await client.responses.create(**create_kwargs)
-    return extract_answer_from_openai_responses(response)
 
 
 async def call_api_once(
     prompt: str,
     item_id: int,
-    temperature: float = TEMPERATURE,
-    top_p: float = TOP_P,
     thinking_budget: int = 10000,
     label: str = "main",
 ) -> str:
-    """统一入口。根据 LLM_PROVIDER 选择具体实现。"""
+    """两条路径：
+      LLM_PROVIDER='anthropic' → messages.create + extended thinking
+      LLM_PROVIDER='openai'    → chat.completions.create + reasoning_effort
+    带指数退避 + 抖动重试。
+    """
     backoff = INITIAL_BACKOFF
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if LLM_PROVIDER == "anthropic":
-                return await _call_anthropic_once(
-                    prompt, item_id, temperature, top_p, thinking_budget, label,
+                resp = await _get_anthropic_client().messages.create(
+                    model=ANTHROPIC_MODEL,
+                    max_tokens=MAX_TOKENS,
+                    thinking={"type": "enabled", "budget_tokens": thinking_budget},
+                    messages=[{"role": "user", "content": prompt}],
                 )
+                for block in resp.content:
+                    if getattr(block, "type", None) == "text":
+                        return clean_answer(block.text)
+                return ""
             elif LLM_PROVIDER == "openai":
-                if OPENAI_USE_RESPONSES_API:
-                    return await _call_openai_responses_once(prompt, item_id, temperature, top_p, label)
-                return await _call_openai_chat_once(prompt, item_id, temperature, top_p, label)
+                resp = await _get_openai_client().chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_completion_tokens=MAX_TOKENS,
+                    reasoning_effort=OPENAI_REASONING_EFFORT,
+                )
+                choices = getattr(resp, "choices", None) or []
+                if not choices:
+                    return ""
+                return clean_answer(getattr(choices[0].message, "content", None) or "")
             else:
-                raise ValueError(f"unknown LLM_PROVIDER {LLM_PROVIDER!r}")
+                raise ValueError(f"unknown LLM_PROVIDER {LLM_PROVIDER!r}; 必须是 'anthropic' 或 'openai'")
         except Exception as e:
-            # 判定可重试性
-            if LLM_PROVIDER == "anthropic":
-                retriable, status = _is_transient_anthropic_error(e)
-            else:
-                retriable, status = _is_transient_openai_error(e)
+            retriable, status = _is_transient_error(e)
             if retriable and attempt < MAX_RETRIES:
                 sleep_s = backoff + random.uniform(0, backoff * 0.5)
                 print(f"  [id={item_id} {label}] transient ({status}), retry {attempt}/{MAX_RETRIES} in {sleep_s:.1f}s")
                 await asyncio.sleep(sleep_s)
                 backoff = min(backoff * 2, 60)
                 continue
-            if retriable:
-                print(f"  [id={item_id} {label}] final fail ({status}) after {attempt}: {e}")
-                return ""
-            # 不可重试 / 未知异常
-            print(f"  [id={item_id} {label}] error: {type(e).__name__}: {e}")
+            print(f"  [id={item_id} {label}] {'final fail' if retriable else 'error'}: {type(e).__name__}: {e}")
             return ""
     return ""
 
@@ -1585,8 +1440,8 @@ async def call_with_voting(item: dict) -> str:
     prompts = make_diverse_prompts(item, n)
     results = await asyncio.gather(
         *(
-            call_api_once(p, item["id"], temperature=t, thinking_budget=thinking_budget, label=label)
-            for p, label, t in prompts
+            call_api_once(p, item["id"], thinking_budget=thinking_budget, label=label)
+            for p, label, _ in prompts
         )
     )
     atype = detect_answer_type(item["question"])
@@ -1642,8 +1497,6 @@ async def verify_and_revise(item: dict, candidate: str) -> str:
     raw = await call_api_once(
         prompt,
         item["id"],
-        temperature=VERIFY_TEMPERATURE,
-        top_p=VERIFY_TOP_P,
         thinking_budget=min(THINKING_BUDGET_BY_TYPE.get(item["task_type"], 10000), 8000),
         label="verify",
     )
@@ -1684,8 +1537,6 @@ async def repair_if_bad(item: dict, candidate: str) -> str:
     raw = await call_api_once(
         prompt,
         item["id"],
-        temperature=0.6,
-        top_p=0.9,
         thinking_budget=min(THINKING_BUDGET_BY_TYPE.get(item["task_type"], 10000), 6000),
         label="repair",
     )
@@ -1948,12 +1799,10 @@ async def main():
     print("=" * 60)
     print(f"CCKS 2026 OneEval v2  |  provider={LLM_PROVIDER}")
     if LLM_PROVIDER == "anthropic":
-        print(f"  model={ANTHROPIC_MODEL}  base={ANTHROPIC_BASE_URL}  effort={ANTHROPIC_OUTPUT_EFFORT}")
+        print(f"  model={ANTHROPIC_MODEL}  base={ANTHROPIC_BASE_URL}")
         print(f"  THINKING_BUDGET: {THINKING_BUDGET_BY_TYPE}")
     else:
-        kind = "responses" if OPENAI_USE_RESPONSES_API else "chat.completions"
-        print(f"  model={OPENAI_MODEL}  base={OPENAI_BASE_URL}  api={kind}")
-        print(f"  reasoning_effort={OPENAI_REASONING_EFFORT}  verbosity={OPENAI_VERBOSITY}  deepseek_thinking={OPENAI_ENABLE_DEEPSEEK_THINKING}")
+        print(f"  model={OPENAI_MODEL}  base={OPENAI_BASE_URL}  reasoning_effort={OPENAI_REASONING_EFFORT}")
     print(f"  VOTING_ROUNDS:   {VOTING_ROUNDS_BY_TYPE}")
     print(f"  KG_SUBGRAPH={ENABLE_KG_SUBGRAPH}  PASSAGE_RANK={ENABLE_PASSAGE_RANK}  VERIFY={ENABLE_VERIFICATION}  REPAIR={ENABLE_REPAIR}")
     print(f"  CONSENSUS={ENABLE_CONSENSUS}  lock_at={CONSENSUS_LOCK_AT}  reset={RESET_CONSENSUS}")
