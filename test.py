@@ -1,27 +1,24 @@
 """
-CCKS 2026 OneEval 解题脚本（DeepSeek V4 Pro + Think Max）  v2
+CCKS 2026 OneEval 解题脚本  v3
 
-升级要点（详见 IMPROVEMENT_REPORT.md）：
-1. 结构化预检索：KG 子图 BFS 抽取；多跳段落 BM25 排序；表格扩展确定性 solver
-2. 顺序扰动 + 风格多样 self-consistency（默认 5 路，可配置）
-3. Evidence-based verification 二次验证
-4. Adaptive thinking_budget 按题型 + 难度自适应
-5. 类型感知答案后处理（count / year / entity / yes-no / list）
-6. 拒答兜底升温重答
-7. 双 Provider 支持：LLM_PROVIDER=anthropic 或 openai（互斥，单次只启用一种）
-   - anthropic：anthropic SDK · messages.create + thinking={"type":"enabled","budget_tokens":N}
-                可对接 Claude Opus 4.7 官方端点，或任何 Anthropic-兼容反代
-   - openai   ：openai SDK · chat.completions.create + reasoning_effort
-                可对接 GPT-5.5 / GPT-5.4 / GLM-5 / GLM-5.1 / DeepSeek-OpenAI 等所有 OpenAI 兼容端点
-8. 跨运行 Consensus：见 IMPROVEMENT_REPORT.md §8（锁定 + 跳过）
+技术栈：
+  - LLM         : anthropic SDK 或 openai SDK（互斥单选，硬编码切换）
+  - KG          : networkx ego_graph 子图抽取 + 关系关键词扩展
+  - 段落检索    : rank_bm25.BM25Okapi  +  sentence-transformers(Qwen3-Embedding-8B/MiniLM)
+                  混合 BM25 + Dense + cross-granularity (paragraph + sentence-max)
+  - NER         : spaCy en_core_web_sm
+  - 表格        : DuckDB SQL + Pandas one-liner（沙盒 eval）+ 内置确定性规则
+  - 推理增强    : Think-on-Graph 迭代探索；问题分解；自一致投票（按 style 加权）
+  - 后处理      : count / year / yes-no / entity / list 类型感知
+  - 持久化      : cross-run consensus（连续 N 次答案一致即锁定，跳过 API 调用）
 
-配置点：直接编辑 test.py 顶部的常量（LLM_PROVIDER / *_API_KEY / *_BASE_URL / *_MODEL ...）。
-不使用环境变量。
+所有配置都在本文件顶部硬编码，不读环境变量。
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import math
 import os
@@ -31,80 +28,132 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any
 
+import anthropic
+import duckdb
+import networkx as nx
+import openai
+import pandas as pd
+import spacy
+import torch
+from rank_bm25 import BM25Okapi
 from rapidfuzz import fuzz
+from sentence_transformers import SentenceTransformer, util as st_util
+from tqdm.auto import tqdm
 
 # ============================================================
-# 配置区
+# 配置区（所有可调常量集中在此处）
 # ============================================================
-# 【Provider 开关】只能选一个："anthropic" | "openai"
-#   anthropic SDK：Claude 系列（Opus/Sonnet 等）官方 API，或任何 Anthropic-兼容端点
-#   openai    SDK：GPT-5.x / GLM-5.x / DeepSeek-OpenAI 等所有 OpenAI 兼容端点
-LLM_PROVIDER = "anthropic"   # "anthropic" 或 "openai"
 
-# ---------- Anthropic SDK（Claude Opus 4.7 等） ----------
+# ---------- LLM Provider（互斥单选） ----------
+# "anthropic": Claude 系列（Opus/Sonnet 等）或任何 Anthropic 兼容反代
+# "openai"   : GPT-5.x / GLM-5.x / DeepSeek-OpenAI 等所有 OpenAI 兼容端点
+LLM_PROVIDER = "anthropic"
+
+# Anthropic 端点（Claude Opus 官方：https://api.anthropic.com / claude-opus-4-7-...）
 ANTHROPIC_API_KEY  = "sk-3b8f9bf9a89c4633a36cc7109ef2026f"
-ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"   # Claude 官方：https://api.anthropic.com
-ANTHROPIC_MODEL    = "deepseek-v4-pro"                       # Claude 官方：claude-opus-4-7-20250...
+ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+ANTHROPIC_MODEL    = "deepseek-v4-pro"
 
-# ---------- OpenAI SDK（GPT-5.5 / GLM-5 / GLM-5.1 等） ----------
+# OpenAI 端点（GPT 官方：https://api.openai.com/v1 / gpt-5.5）
+#               （GLM   ：https://open.bigmodel.cn/api/paas/v4/ / glm-5）
 OPENAI_API_KEY  = "sk-3b8f9bf9a89c4633a36cc7109ef2026f"
-OPENAI_BASE_URL = "https://api.deepseek.com"                 # GPT  ：https://api.openai.com/v1
-                                                              # GLM  ：https://open.bigmodel.cn/api/paas/v4/
-OPENAI_MODEL    = "deepseek-v4-pro"                          # GPT  ：gpt-5.5 / gpt-5.4
-                                                              # GLM  ：glm-5 / glm-5.1
-OPENAI_REASONING_EFFORT = "high"                              # 推理力度，统一 high；OpenAI 还支持 minimal/low/medium
+OPENAI_BASE_URL = "https://api.deepseek.com"
+OPENAI_MODEL    = "deepseek-v4-pro"
+OPENAI_REASONING_EFFORT = "high"   # minimal | low | medium | high
 
-INPUT_FILE = "contest_data.json"
-OUTPUT_FILE = "submit.jsonl"
-RAW_OUTPUT_FILE = "submit_raw.jsonl"
-
-# Anthropic extended-thinking 预算（按题型）；OpenAI SDK 用 reasoning_effort，无 budget 概念
-THINKING_BUDGET_BY_TYPE = {
+# ---------- 调用参数 ----------
+MAX_TOKENS = 16000                  # Anthropic.max_tokens / OpenAI.max_completion_tokens
+THINKING_BUDGET_BY_TYPE = {         # Anthropic extended-thinking 预算（OpenAI 用 reasoning_effort）
     "knowledge_graph": 10000,
     "multi_hop_qa": 12000,
     "table_qa": 8000,
 }
-MAX_TOKENS = 16000   # Anthropic: max_tokens；OpenAI: max_completion_tokens
-
-CONCURRENCY = 80
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 2.0
-REANSWER_BAD = True
+REANSWER_BAD = True                 # 答案是 "Unknown/None/..." 时升温重答
 
-# 顺序扰动 self-consistency 路数（按题型）
+# ---------- 数据文件 ----------
+INPUT_FILE = "contest_data.json"
+OUTPUT_FILE = "submit.jsonl"
+RAW_OUTPUT_FILE = "submit_raw.jsonl"
+
+# ---------- 自一致投票 ----------
 VOTING_ROUNDS_BY_TYPE = {
     "knowledge_graph": 5,
     "multi_hop_qa": 5,
     "table_qa": 3,
 }
+ENABLE_WEIGHTED_VOTING = True
+STYLE_WEIGHTS = {                   # 不同 prompt 风格的投票权重
+    "cot": 1.5,
+    "evidence": 1.3,
+    "decompose": 1.2,
+    "direct": 1.0,
+    "tog": 1.4,
+}
 
+# ---------- KG 子图 ----------
 ENABLE_KG_SUBGRAPH = True
 KG_SUBGRAPH_DEPTH = 2
-KG_SUBGRAPH_MAX = 90        # 子图保留上限
-KG_SUBGRAPH_KEEP_AT_LEAST = 30  # 子图过小时补足到此数量
-KG_SUBGRAPH_MIN_RAW = 25    # 三元组少于这个数就不裁剪（保留全部）
+KG_SUBGRAPH_MAX = 90                # 上限
+KG_SUBGRAPH_KEEP_AT_LEAST = 30      # 子图过小时补足到此数量
+KG_SUBGRAPH_MIN_RAW = 25            # 三元组少于此数就不裁剪
 
+# ---------- 段落 BM25 + Dense 检索 ----------
 ENABLE_PASSAGE_RANK = True
 PASSAGE_RANK_KEEP = 6
+HYBRID_BM25_WEIGHT = 0.5            # 与 dense 的线性融合系数
+ENABLE_CROSS_GRANULARITY = True     # paragraph + sentence-max 融合
+SENT_WEIGHT_IN_CROSSG = 0.4
 
+# ---------- 稠密 embedding 模型 ----------
+# CUDA 可用 → Qwen3-Embedding-8B；否则 MiniLM-L6-v2
+DENSE_MODEL_GPU = "Qwen/Qwen3-Embedding-8B"
+DENSE_MODEL_CPU = "sentence-transformers/all-MiniLM-L6-v2"
+DENSE_BATCH_GPU = 32
+DENSE_BATCH_CPU = 16
+
+# ---------- 推理增强 ----------
+ENABLE_TOG = True                   # Think-on-Graph 迭代探索（KG）
+TOG_MAX_HOPS = 3
+ENABLE_DECOMPOSE = True             # 多跳问题分解（multi_hop_qa）
+DECOMPOSE_PER_SUB_TOPK = 2
+
+# ---------- 表格 ----------
+ENABLE_TABLE_SQL = True             # DuckDB SQL 兜底
+ENABLE_TABLE_PANDAS_CODE = True     # Pandas one-liner 兜底
+
+# ---------- 答案验证 / 修复 ----------
 ENABLE_VERIFICATION = True
 ENABLE_REPAIR = True
 
-# ============================================================
-# Provider 客户端初始化（延迟）
-# ============================================================
-_anthropic_client = None
-_openai_client = None
-_anthropic_mod = None
-_openai_mod = None
+# ---------- 并发控制 ----------
+CONCURRENCY_BY_TYPE = {             # verifier(1) + repair(0~1) 额外开销，故分级限流
+    "knowledge_graph": 30,
+    "multi_hop_qa": 30,
+    "table_qa": 40,
+}
+
+# ---------- Cross-run consensus ----------
+ENABLE_CONSENSUS = True
+RESET_CONSENSUS = False
+CONSENSUS_LOCK_AT = 2               # 连续 N 次答案相同就锁定
+CONSENSUS_STATE_FILE = "consensus_state.json"
+CONSENSUS_FINAL_FILE = "consensus_final.jsonl"
+CONSENSUS_RUNS_DIR = "runs"
 
 
-def _get_anthropic_client():
-    global _anthropic_client, _anthropic_mod
+# ============================================================
+# Provider 客户端（延迟初始化）
+# ============================================================
+_anthropic_client: anthropic.AsyncAnthropic | None = None
+_openai_client: openai.AsyncOpenAI | None = None
+
+
+def _get_anthropic_client() -> anthropic.AsyncAnthropic:
+    global _anthropic_client
     if _anthropic_client is None:
-        import anthropic as _anth  # type: ignore
-        _anthropic_mod = _anth
-        _anthropic_client = _anth.AsyncAnthropic(
+        _anthropic_client = anthropic.AsyncAnthropic(
             api_key=ANTHROPIC_API_KEY,
             base_url=ANTHROPIC_BASE_URL,
             timeout=600.0,
@@ -112,26 +161,69 @@ def _get_anthropic_client():
     return _anthropic_client
 
 
-def _get_openai_client():
-    global _openai_client, _openai_mod
+def _get_openai_client() -> openai.AsyncOpenAI:
+    global _openai_client
     if _openai_client is None:
-        import openai as _oai  # type: ignore
-        _openai_mod = _oai
-        kwargs: dict[str, Any] = {"api_key": OPENAI_API_KEY, "timeout": 600.0}
-        if OPENAI_BASE_URL:
-            kwargs["base_url"] = OPENAI_BASE_URL
-        _openai_client = _oai.AsyncOpenAI(**kwargs)
+        _openai_client = openai.AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            timeout=600.0,
+        )
     return _openai_client
 
 
-def _ensure_provider_modules():
-    """预热当前 provider 的 SDK 模块，以便后续 except 能访问到类型。"""
+def _ensure_provider_modules() -> None:
+    """预热当前 provider 的 client。"""
     if LLM_PROVIDER == "anthropic":
         _get_anthropic_client()
     elif LLM_PROVIDER == "openai":
         _get_openai_client()
     else:
-        raise ValueError(f"未知 LLM_PROVIDER: {LLM_PROVIDER!r}; 请设为 'anthropic' 或 'openai'")
+        raise ValueError(f"未知 LLM_PROVIDER: {LLM_PROVIDER!r}; 必须是 'anthropic' 或 'openai'")
+
+
+# ============================================================
+# 其它库的延迟加载（spaCy / sentence-transformers）
+# ============================================================
+_spacy_nlp = None  # type: ignore
+_dense_model: SentenceTransformer | None = None
+_DENSE_DEVICE: str = "cpu"
+_DENSE_BATCH: int = DENSE_BATCH_CPU
+
+
+def _get_spacy_nlp():
+    """spaCy en_core_web_sm，禁用不需要的 pipeline 加速。"""
+    global _spacy_nlp
+    if _spacy_nlp is None:
+        _spacy_nlp = spacy.load(
+            "en_core_web_sm",
+            disable=["tagger", "parser", "lemmatizer"],
+        )
+    return _spacy_nlp
+
+
+def _get_dense_model() -> SentenceTransformer:
+    """加载稠密 embedding 模型。CUDA 可用 → Qwen3-8B(bf16)；否则 MiniLM。"""
+    global _dense_model, _DENSE_DEVICE, _DENSE_BATCH
+    if _dense_model is None:
+        if torch.cuda.is_available():
+            _DENSE_DEVICE = "cuda"
+            model_name = DENSE_MODEL_GPU
+            _DENSE_BATCH = DENSE_BATCH_GPU
+            print(f"[dense] loading {model_name} on cuda (bf16) ...")
+            _dense_model = SentenceTransformer(
+                model_name,
+                device="cuda",
+                model_kwargs={"torch_dtype": torch.bfloat16},
+            )
+        else:
+            _DENSE_DEVICE = "cpu"
+            model_name = DENSE_MODEL_CPU
+            _DENSE_BATCH = DENSE_BATCH_CPU
+            print(f"[dense] loading {model_name} on cpu ...")
+            _dense_model = SentenceTransformer(model_name, device="cpu")
+    return _dense_model
+
 
 BAD_ANSWER_PATTERNS = (
     "none",
@@ -182,9 +274,14 @@ def tokenize(text: str, keep_short: bool = False) -> list[str]:
     return [t for t in toks if t not in STOPWORDS]
 
 
+_NER_LABELS = {"PERSON", "ORG", "GPE", "LOC", "WORK_OF_ART", "EVENT", "FAC", "PRODUCT", "NORP"}
+
+
 def extract_proper_nouns(text: str) -> list[str]:
-    """提取问句中疑似专有名词（连续 Capitalized words + 引号包裹串 + 引文）。"""
-    candidates: list[str] = []
+    """提取问句中疑似专有名词。spaCy NER + 引号/大写连词补充。"""
+    doc = _get_spacy_nlp()(text)
+    candidates: list[str] = [ent.text for ent in doc.ents if ent.label_ in _NER_LABELS]
+    # 补充：引号包围 / 连续 Capitalized words（NER 模型偶尔漏掉的专名）
     candidates.extend(re.findall(r'"([^"]+)"', text))
     candidates.extend(re.findall(r"'([^']{2,})'", text))
     candidates.extend(re.findall(r"\b((?:[A-Z][\w'’.\-]+)(?:\s+[A-Z][\w'’.\-]+)*)\b", text))
@@ -222,26 +319,34 @@ def parse_triples(raw: str) -> list[str]:
     return triples
 
 
+# relation 通常是：
+#  (a) Freebase 点分串：`film.film.starring..film.performance.actor` 或 `people.person.born_in`
+#  (b) 大写式：`LOCATED_IN` / `IS_A`
+# Freebase 三元组允许 .. 形式（CVT 节点），所以允许内部 dots：`[A-Za-z_][\w.]*\.[\w.]*\w`
+_REL_PATTERN = r"[A-Za-z_][\w.]*\.[\w.]*\w|[A-Z][A-Z0-9_]{2,}"
+_REL_TOKEN_RE = re.compile(rf"^(?:{_REL_PATTERN})$")
+_TRIPLE_DELIMITER_RE = re.compile(rf"^(.+?)\s+({_REL_PATTERN})\s+(.+)$")
+
+
 def split_triple(triple: str) -> tuple[str, str, str]:
     """启发式拆分 <head> <relation> <tail>。
-    relation 通常是包含 '.' 的标记式串（如 film.film.starring..film.performance.actor 或 location.location.contains）。
+    优先正则一把抓；失败 fall back 到原 token 扫描；最后退化为按空格三段。
     """
-    # 找包含 '.' 的最长 token 作为 relation；若失败退化为按空格 3 段
+    triple = triple.strip()
+    m = _TRIPLE_DELIMITER_RE.match(triple)
+    if m:
+        return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
     tokens = triple.split(" ")
-    rel_idx = -1
     for i, tok in enumerate(tokens):
-        if "." in tok and not tok.replace(".", "").isdigit():
-            rel_idx = i
-            break
-    if rel_idx == -1:
-        # fallback：按空格
-        if len(tokens) >= 3:
-            return tokens[0], tokens[1], " ".join(tokens[2:])
-        return triple, "", ""
-    head = " ".join(tokens[:rel_idx]).strip()
-    relation = tokens[rel_idx]
-    tail = " ".join(tokens[rel_idx + 1:]).strip()
-    return head, relation, tail
+        if _REL_TOKEN_RE.match(tok):
+            return (
+                " ".join(tokens[:i]).strip(),
+                tok,
+                " ".join(tokens[i + 1:]).strip(),
+            )
+    if len(tokens) >= 3:
+        return tokens[0], tokens[1], " ".join(tokens[2:])
+    return triple, "", ""
 
 
 def build_kg_index(triples: list[str]) -> tuple[dict[str, list[int]], list[tuple[str, str, str]]]:
@@ -323,13 +428,32 @@ def find_relation_keywords(question: str) -> set[str]:
     return kws
 
 
+def build_kg_graph_nx(triples: list[str]):
+    """把三元组列表构造成 networkx.DiGraph（节点 = normalize_text(实体)，边携带 raw 三元组与 relation）。"""
+    G = nx.DiGraph()
+    for t in triples:
+        h, r, tail = split_triple(t)
+        hh, tt = normalize_text(h), normalize_text(tail)
+        if hh and tt:
+            G.add_edge(hh, tt, relation=r, raw=t)
+    return G
+
+
+@functools.lru_cache(maxsize=512)
+def _build_kg_graph_cached(triples_tuple: tuple):
+    """缓存：同一 item 同一三元组集合只建一次图。"""
+    return build_kg_graph_nx(list(triples_tuple))
+
+
 def extract_subgraph(
     triples: list[str],
     question: str,
     depth: int = KG_SUBGRAPH_DEPTH,
     cap: int = KG_SUBGRAPH_MAX,
 ) -> list[str]:
-    """从问题实体出发 BFS depth 跳的子图 + 相关关系匹配。失败回退到原列表。"""
+    """从问题实体出发 BFS depth 跳的子图 + 相关关系匹配。失败回退到原列表。
+    BFS 走 networkx.ego_graph，外加 cap 截断与关系关键词扩展。
+    """
     if len(triples) <= KG_SUBGRAPH_MIN_RAW:
         return triples
     idx, parsed = build_kg_index(triples)
@@ -339,29 +463,31 @@ def extract_subgraph(
     selected: set[int] = set()
     seed_triple_indices: set[int] = set()
     if seeds:
-        frontier = set(seeds)
-        for hop in range(depth):
-            next_frontier: set[str] = set()
-            for ent in frontier:
-                for ti in idx.get(ent, []):
-                    if ti in selected:
-                        continue
-                    selected.add(ti)
-                    if hop == 0:
-                        seed_triple_indices.add(ti)
-                    if len(selected) >= cap:
-                        break
-                    h, _r, t = parsed[ti]
-                    hh, tt = normalize_text(h), normalize_text(t)
-                    if hh and hh != ent and hh not in frontier:
-                        next_frontier.add(hh)
-                    if tt and tt != ent and tt not in frontier:
-                        next_frontier.add(tt)
+        G = _build_kg_graph_cached(tuple(triples))
+        bfs_nodes: set[str] = set()
+        for seed in seeds:
+            if seed not in G:
+                continue
+            try:
+                sub = nx.ego_graph(G, seed, radius=depth, undirected=True)
+                bfs_nodes |= set(sub.nodes())
+            except Exception:
+                continue
+        bfs_nodes |= set(seeds)
+        # 把所有"两端都在 bfs_nodes 内"的边对应的三元组索引收进 selected；先 seed-邻接，再多跳
+        for ent in seeds:
+            for ti in idx.get(ent, []):
                 if len(selected) >= cap:
                     break
-            frontier = next_frontier - frontier
-            if len(selected) >= cap or not frontier:
-                break
+                selected.add(ti)
+                seed_triple_indices.add(ti)
+        for i, (h, _r, t) in enumerate(parsed):
+            if i in selected:
+                continue
+            if normalize_text(h) in bfs_nodes or normalize_text(t) in bfs_nodes:
+                selected.add(i)
+                if len(selected) >= cap:
+                    break
 
     # 关系关键词扩充（不耗尽 cap）
     rel_kws = find_relation_keywords(question)
@@ -427,42 +553,20 @@ def format_kg_triples_grouped(triples_list: list[str]) -> str:
 
 
 # ============================================================
-# 多跳段落 BM25 排序
+# 多跳段落 BM25 + Dense + Hybrid + Cross-Granularity 排序
+# (rank_bm25 + sentence-transformers)
 # ============================================================
-def bm25_rank(question: str, passages: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
-    """简化 BM25。返回每段的分数。"""
+def _bm25_scores(question: str, passages: list[str]) -> list[float]:
+    """rank_bm25.BM25Okapi 评分 + 专有名词原串子串加分。"""
     if not passages:
         return []
     q_tokens = tokenize(question)
-    # 也加入专有名词的全文形式（作为单 token）
     pns = [normalize_text(p) for p in extract_proper_nouns(question)]
     q_tokens = q_tokens + pns
-
     docs = [tokenize(p) for p in passages]
-    avgdl = sum(len(d) for d in docs) / max(1, len(docs))
-    df: Counter = Counter()
-    for d in docs:
-        for term in set(d):
-            df[term] += 1
-    N = len(docs)
-    scores = []
-    for d in docs:
-        d_len = len(d)
-        tf = Counter(d)
-        s = 0.0
-        for q in set(q_tokens):
-            if q not in tf:
-                # 也试一下子串匹配（专有名词常嵌入段落字符串）
-                pass
-            n_q = df.get(q, 0)
-            if n_q == 0:
-                continue
-            idf = math.log(1 + (N - n_q + 0.5) / (n_q + 0.5))
-            term_tf = tf.get(q, 0)
-            s += idf * (term_tf * (k1 + 1)) / (term_tf + k1 * (1 - b + b * d_len / max(1, avgdl)))
-        scores.append(s)
-
-    # 加分：段落字符串中是否出现问题专有名词原串
+    bm25 = BM25Okapi(docs)
+    scores = list(bm25.get_scores(q_tokens))
+    # 子串命中加分
     for i, p in enumerate(passages):
         pl = p.lower()
         for pn in pns:
@@ -471,17 +575,126 @@ def bm25_rank(question: str, passages: list[str], k1: float = 1.5, b: float = 0.
     return scores
 
 
-def rank_passages(question: str, contexts: list[dict], top_k: int = PASSAGE_RANK_KEEP) -> list[tuple[int, dict]]:
-    """对 multi_hop_qa 段落按相关性降序排序，并返回 [(原 index, ctx), ...]。"""
-    passages = []
+def _normalize_scores(scores: list[float]) -> list[float]:
+    """Min-max 归一化。"""
+    if not scores:
+        return []
+    mn, mx = min(scores), max(scores)
+    if mx - mn < 1e-9:
+        return [0.0] * len(scores)
+    return [(s - mn) / (mx - mn) for s in scores]
+
+
+def _dense_scores(question: str, passages: list[str]) -> list[float]:
+    """sentence-transformers 余弦相似度。"""
+    if not passages:
+        return []
+    model = _get_dense_model()
+    q_emb = model.encode(question, convert_to_tensor=True, show_progress_bar=False)
+    c_emb = model.encode(
+        passages,
+        convert_to_tensor=True,
+        batch_size=_DENSE_BATCH,
+        show_progress_bar=False,
+    )
+    sims = st_util.cos_sim(q_emb, c_emb)[0]
+    return [float(s) for s in sims.cpu().tolist()]
+
+
+def _cross_granularity_dense_scores(question: str, contexts: list[dict]) -> list[float]:
+    """段落级 + 句子级 max 融合。所有文本一次性 batch encode（单次 forward pass）。"""
+    if not contexts:
+        return []
+    model = _get_dense_model()
+    all_texts: list[str] = []
+    para_indices: list[int] = []
+    sent_ranges: list[tuple[int, int]] = []
+    for c in contexts:
+        para = c.get("paragraph") or " ".join(c.get("sentences", []))
+        sents = c.get("sentences") or [para]
+        para_indices.append(len(all_texts))
+        all_texts.append(para or " ")
+        sent_start = len(all_texts)
+        all_texts.extend((s or " ") for s in sents)
+        sent_ranges.append((sent_start, len(all_texts)))
+    all_embs = model.encode(
+        all_texts,
+        convert_to_tensor=True,
+        batch_size=_DENSE_BATCH,
+        show_progress_bar=False,
+    )
+    q_emb = model.encode(question, convert_to_tensor=True, show_progress_bar=False)
+    results: list[float] = []
+    for i in range(len(contexts)):
+        p_idx = para_indices[i]
+        p_score = float(st_util.cos_sim(q_emb, all_embs[p_idx:p_idx + 1])[0, 0])
+        s_start, s_end = sent_ranges[i]
+        if s_end > s_start:
+            s_score = float(st_util.cos_sim(q_emb, all_embs[s_start:s_end])[0].max())
+        else:
+            s_score = 0.0
+        results.append((1 - SENT_WEIGHT_IN_CROSSG) * p_score + SENT_WEIGHT_IN_CROSSG * s_score)
+    return results
+
+
+# 每 item 一次的排序缓存（key = (item_id, question, len(contexts)))；solve_item 退出前 clear
+_RANK_CACHE: dict[tuple, list[tuple[int, dict]]] = {}
+
+
+def _rank_cache_key(item_id: int | None, question: str, contexts: list[dict], top_k: int) -> tuple:
+    return (item_id, question, len(contexts), top_k)
+
+
+def _passages_text(contexts: list[dict]) -> list[str]:
+    """统一构造 BM25/dense 的 passage 文本：'title. paragraph'。"""
+    out = []
     for c in contexts:
         title = c.get("title", "")
         text = c.get("paragraph") or " ".join(c.get("sentences", []))
-        passages.append(f"{title}. {text}")
-    scores = bm25_rank(question, passages)
-    order = sorted(range(len(contexts)), key=lambda i: -scores[i])
+        out.append(f"{title}. {text}")
+    return out
+
+
+def rank_passages(
+    question: str,
+    contexts: list[dict],
+    top_k: int = PASSAGE_RANK_KEEP,
+    item_id: int | None = None,
+) -> list[tuple[int, dict]]:
+    """Hybrid BM25 + Cross-Granularity Dense 段落排序。每 item 缓存一次。"""
+    if not contexts:
+        return []
+    cache_key = _rank_cache_key(item_id, question, contexts, top_k)
+    cached = _RANK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    passages = _passages_text(contexts)
+    bm25_n = _normalize_scores(_bm25_scores(question, passages))
+    crossg_n = _normalize_scores(_cross_granularity_dense_scores(question, contexts))
+    combined = [
+        HYBRID_BM25_WEIGHT * b + (1 - HYBRID_BM25_WEIGHT) * d
+        for b, d in zip(bm25_n, crossg_n)
+    ]
+    order = sorted(range(len(contexts)), key=lambda i: -combined[i])
     keep = order[:top_k] if top_k and top_k < len(contexts) else order
-    return [(i, contexts[i]) for i in keep]
+    result = [(i, contexts[i]) for i in keep]
+    _RANK_CACHE[cache_key] = result
+    return result
+
+
+def rank_passages_for_subq(sub_q: str, contexts: list[dict], top_k: int) -> list[tuple[int, dict]]:
+    """子问题的轻量级排序（BM25 + 段落级 dense，不做 cross-granularity 节省 encode 量）。"""
+    if not contexts:
+        return []
+    passages = _passages_text(contexts)
+    bm25_n = _normalize_scores(_bm25_scores(sub_q, passages))
+    dense_n = _normalize_scores(_dense_scores(sub_q, passages))
+    combined = [
+        HYBRID_BM25_WEIGHT * b + (1 - HYBRID_BM25_WEIGHT) * d
+        for b, d in zip(bm25_n, dense_n)
+    ]
+    order = sorted(range(len(contexts)), key=lambda i: -combined[i])
+    return [(i, contexts[i]) for i in order[:top_k]]
 
 
 # ============================================================
@@ -1079,7 +1292,7 @@ def build_mhqa_prompt(item: dict, style: str = "cot", ranked: list[dict] | None 
     if ranked is not None:
         contexts = ranked
     elif ENABLE_PASSAGE_RANK:
-        contexts = [c for _, c in rank_passages(item["question"], item["contexts"])]
+        contexts = [c for _, c in rank_passages(item["question"], item["contexts"], item_id=item["id"])]
     else:
         contexts = item["contexts"]
 
@@ -1175,6 +1388,229 @@ def build_prompt(item: dict, style: str = "cot", **kwargs) -> str:
     if tt == "table_qa":
         return build_table_prompt(item, style=style)
     raise ValueError(f"未知题型: {tt}")
+
+
+# ============================================================
+# Think-on-Graph 迭代探索（KG）
+# ============================================================
+async def tog_iterative_explore(item: dict) -> str:
+    """逐跳扩展实体集，每跳让 LLM 决定继续探索还是给出 FINAL 答案。"""
+    raw_triples = parse_triples(item["input"])
+    if not raw_triples:
+        return ""
+    question = item["question"]
+    seed_ents = extract_proper_nouns(question)
+    explored: list[str] = []
+    reasoning: list[str] = []
+    current_query = question
+
+    for hop in range(TOG_MAX_HOPS):
+        sub = extract_subgraph(raw_triples, current_query) if ENABLE_KG_SUBGRAPH else raw_triples
+        view = sub[:60]
+        prompt = (
+            "Knowledge Graph (relevant subgraph):\n"
+            f"{format_kg_triples_grouped(view)}\n\n"
+            f"Original question: {question}\n"
+            f"Seed entities: {seed_ents}\n"
+            f"Reasoning so far: {' | '.join(reasoning) if reasoning else 'none'}\n\n"
+            "Decide:\n"
+            "1) If you can answer now, output exactly: FINAL: <answer>\n"
+            "2) Otherwise output: NEXT: <intermediate entity or relation> (one line, used to expand search)\n"
+            "Do not output anything else."
+        )
+        raw = await call_api_once(prompt, item["id"], thinking_budget=8000, label=f"tog-hop{hop}")
+        if not raw:
+            break
+        raw_strip = raw.strip()
+        if "FINAL:" in raw_strip.upper():
+            ans = re.split(r"FINAL\s*:\s*", raw_strip, maxsplit=1, flags=re.IGNORECASE)[-1]
+            return clean_answer(ans)
+        m = re.search(r"NEXT\s*:\s*(.+)", raw_strip, re.IGNORECASE)
+        if m:
+            hint = m.group(1).strip()
+            reasoning.append(hint[:120])
+            current_query = f"{question} {hint}"
+            new_ents = [e for e in extract_proper_nouns(hint) if e not in explored]
+            explored.extend(new_ents)
+        else:
+            # 模型没遵循格式，直接返回它的输出作为答案
+            return clean_answer(raw_strip)
+    # 兜底：直接走 cot 路径
+    return await call_api_once(build_kg_prompt(item, style="cot"), item["id"], label="tog-final")
+
+
+# ============================================================
+# 问题分解 + 子问题级检索（multi_hop_qa）
+# ============================================================
+def _parse_sub_questions(raw: str) -> list[str]:
+    """三段式解析：```json``` 代码块 → ["..."] 数组 → 按行抓 ? 结尾。"""
+    if not raw:
+        return []
+    # 1) ```json``` 包裹
+    cb = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    blob = cb.group(1) if cb else raw
+    # 2) 找含 sub_questions 的 JSON 对象
+    m = re.search(r"\{[^{}]*\"sub_questions\"\s*:\s*\[[^\]]*\][^{}]*\}", blob, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            subs = data.get("sub_questions") or []
+            subs = [s.strip() for s in subs if isinstance(s, str) and s.strip()]
+            if subs:
+                return subs[:4]
+        except json.JSONDecodeError:
+            pass
+    # 3) 找 ["...", "..."] 形式
+    arr = re.search(r"\[\s*\"[^\"]+\"(?:\s*,\s*\"[^\"]+\")*\s*\]", blob, re.DOTALL)
+    if arr:
+        try:
+            subs = [s.strip() for s in json.loads(arr.group(0)) if isinstance(s, str) and s.strip()]
+            if subs:
+                return subs[:4]
+        except json.JSONDecodeError:
+            pass
+    # 4) 按行抓 `1. ... ?` / `- ... ?`
+    lines = [ln.strip().lstrip("0123456789.-) ").strip() for ln in raw.splitlines() if ln.strip()]
+    qs = [ln for ln in lines if "?" in ln and len(ln) > 10]
+    return qs[:4]
+
+
+async def decompose_question(item: dict) -> list[str]:
+    """让 LLM 把 multi-hop 拆成 2–3 个子问题。失败回退到原问题。"""
+    prompt = (
+        "Decompose the following multi-hop question into 2-3 sequential sub-questions.\n"
+        "Each sub-question must be answerable from the given documents.\n"
+        f"Question: {item['question']}\n\n"
+        'Output STRICT JSON only, no prose: {"sub_questions": ["q1", "q2", ...]}'
+    )
+    raw = await call_api_once(prompt, item["id"], thinking_budget=4000, label="decompose")
+    subs = _parse_sub_questions(raw)
+    return subs if subs else [item["question"]]
+
+
+async def decompose_and_retrieve(item: dict, per_sub_topk: int = DECOMPOSE_PER_SUB_TOPK) -> list[dict]:
+    """每个子问题独立检索 top-k 段落，合并去重，返回排序后的 contexts。"""
+    subs = await decompose_question(item)
+    seen: set[int] = set()
+    out: list[dict] = []
+    for sq in subs:
+        ranked = rank_passages_for_subq(sq, item["contexts"], per_sub_topk)
+        for idx, ctx in ranked:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            out.append(ctx)
+    # 兜底：如果分解得到的太少，把全局 top-k 补上
+    if len(out) < PASSAGE_RANK_KEEP:
+        for idx, ctx in rank_passages(item["question"], item["contexts"], PASSAGE_RANK_KEEP, item_id=item["id"]):
+            if idx not in seen:
+                out.append(ctx)
+                seen.add(idx)
+                if len(out) >= PASSAGE_RANK_KEEP:
+                    break
+    return out
+
+
+# ============================================================
+# Pandas / DuckDB 表格兜底
+# ============================================================
+def _table_to_df(table: dict) -> pd.DataFrame:
+    return pd.DataFrame(table["rows"], columns=table["header"])
+
+
+def _safe_str(v) -> str:
+    return "" if v is None else str(v).strip()
+
+
+# pandas one-liner 沙盒：禁止任何危险 token
+_PANDAS_CODE_BLOCKED = re.compile(
+    r"__|\bimport\b|\bexec\b|\beval\b|\bopen\b|\bos\b|\bsys\b|\bsubprocess\b"
+    r"|\bgetattr\b|\bsetattr\b|\bdelattr\b|\bglobals\b|\blocals\b|\bvars\b"
+    r"|\bcompile\b|\b__\w+__\b"
+)
+_PANDAS_SAFE_BUILTINS = {
+    "len": len, "min": min, "max": max, "sum": sum, "abs": abs,
+    "round": round, "sorted": sorted, "set": set, "list": list,
+    "tuple": tuple, "dict": dict, "str": str, "int": int, "float": float,
+    "bool": bool, "enumerate": enumerate, "zip": zip, "range": range,
+    "any": any, "all": all,
+}
+
+
+async def solve_table_with_duckdb_sql(item: dict) -> str | None:
+    """让 LLM 生成 DuckDB SQL，本地执行后取第一行第一列作为答案。"""
+    if not ENABLE_TABLE_SQL:
+        return None
+    df = _table_to_df(item["table"])
+    header = item["table"]["header"]
+    sample_rows = item["table"]["rows"][:3]
+    prompt = (
+        "You are an expert at writing DuckDB SQL queries.\n"
+        f"There is a DuckDB-registered DataFrame named `df` with columns: {header}\n"
+        f"Sample rows: {sample_rows}\n\n"
+        f"Question: {item['question']}\n\n"
+        "Write ONE DuckDB SQL statement that produces the answer in its first row/first column.\n"
+        "Output ONLY the SQL statement. No markdown fences. No explanation.\n"
+    )
+    sql = await call_api_once(prompt, item["id"], thinking_budget=4000, label="table-sql")
+    if not sql:
+        return None
+    sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql.strip(), flags=re.IGNORECASE | re.MULTILINE).strip().rstrip(";")
+    if not sql or len(sql) > 800:
+        return None
+    try:
+        con = duckdb.connect()
+        con.register("df", df)
+        result = con.execute(sql).fetchdf()
+        con.close()
+    except Exception as e:
+        print(f"  [id={item['id']}] table-sql failed: {type(e).__name__}: {e}")
+        return None
+    if result is None or result.empty:
+        return None
+    return _safe_str(result.iloc[0, 0]) or None
+
+
+async def solve_table_with_pandas_code(item: dict) -> str | None:
+    """让 LLM 生成一行 pandas 表达式（变量 `df`），在受限沙盒中 eval。"""
+    if not ENABLE_TABLE_PANDAS_CODE:
+        return None
+    df = _table_to_df(item["table"])
+    header = item["table"]["header"]
+    df_head = df.head(3).to_string()
+    prompt = (
+        "You are an expert at writing one-line pandas expressions.\n"
+        f"A DataFrame `df` is already defined with columns: {header}\n"
+        f"Preview:\n{df_head}\n\n"
+        f"Question: {item['question']}\n\n"
+        "Write a SINGLE LINE of pandas code that computes the answer.\n"
+        "Use only `df` and `pd`. Output ONLY the expression, no assignment, no print, no fences.\n"
+        "Examples: df.loc[df['Year']==2020, 'Score'].sum() ; df['City'].iloc[0] ; len(df)\n"
+    )
+    code = await call_api_once(prompt, item["id"], thinking_budget=3000, label="table-pandas")
+    if not code:
+        return None
+    code = re.sub(r"^```(?:python)?\s*|\s*```$", "", code.strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+    if not code or len(code) > 400 or "\n" in code or ";" in code:
+        return None
+    if _PANDAS_CODE_BLOCKED.search(code):
+        print(f"  [id={item['id']}] table-pandas blocked: {code[:80]}")
+        return None
+    try:
+        result = eval(
+            code,
+            {"__builtins__": _PANDAS_SAFE_BUILTINS},
+            {"df": df, "pd": pd},
+        )
+    except Exception as e:
+        print(f"  [id={item['id']}] table-pandas eval failed: {type(e).__name__}: {e}")
+        return None
+    # Series / DataFrame → 取首元素
+    if isinstance(result, pd.Series):
+        result = result.iloc[0] if len(result) else None
+    elif isinstance(result, pd.DataFrame):
+        result = result.iloc[0, 0] if not result.empty else None
+    return _safe_str(result) or None
 
 
 # ============================================================
@@ -1309,6 +1745,59 @@ def majority_vote(answers: list[str], atype: AnswerType) -> str:
     return valid[0]
 
 
+def _style_weight_from_label(label: str) -> float:
+    """label 形如 'kg-cot-t0.3' / 'mh-evidence-t0.2' → 取中间风格名查 STYLE_WEIGHTS。"""
+    parts = label.split("-")
+    for p in parts:
+        if p in STYLE_WEIGHTS:
+            return STYLE_WEIGHTS[p]
+    return 1.0
+
+
+def weighted_majority_vote(
+    answers: list[str],
+    labels: list[str],
+    atype: AnswerType,
+) -> str:
+    """按 style 加权 + 数值/实体感知投票。"""
+    if not ENABLE_WEIGHTED_VOTING:
+        return majority_vote(answers, atype)
+    pairs = [(a, l) for a, l in zip(answers, labels) if a]
+    if not pairs:
+        return ""
+    # 数值场景：先把每个答案 coerce 到数值字符串，再加权
+    if atype.is_numeric:
+        weights: dict[str, float] = defaultdict(float)
+        for a, lbl in pairs:
+            n = coerce_answer(a, atype)
+            if not n:
+                continue
+            weights[normalize_text(n)] += _style_weight_from_label(lbl)
+        if weights:
+            # 直接返回票数最高的归一化字符串本身（coerce 后已是干净数字）
+            return max(weights, key=weights.__getitem__)
+    # 通用：加权 + 用 fuzzy bucket
+    buckets: list[tuple[str, float, str]] = []  # (norm, weight, raw)
+    for a, lbl in pairs:
+        if is_bad_answer(a):
+            continue
+        an = normalize_text(a)
+        w = _style_weight_from_label(lbl)
+        # 与已有 bucket fuzzy 合并
+        matched = False
+        for i, (bn, bw, _) in enumerate(buckets):
+            if bn == an or fuzz.token_set_ratio(an, bn) >= 88:
+                buckets[i] = (bn, bw + w, buckets[i][2])
+                matched = True
+                break
+        if not matched:
+            buckets.append((an, w, a))
+    if buckets:
+        buckets.sort(key=lambda x: -x[1])
+        return buckets[0][2]
+    return pairs[0][0]
+
+
 def is_bad_answer(answer: str) -> bool:
     text = normalize_text(answer).strip(" .。")
     if not text:
@@ -1321,17 +1810,12 @@ def is_bad_answer(answer: str) -> bool:
 # ============================================================
 def _is_transient_error(exc: Exception) -> tuple[bool, int | None]:
     """判断当前 provider 的异常是否可重试。返回 (是否重试, status_code)。"""
-    mod = _anthropic_mod if LLM_PROVIDER == "anthropic" else _openai_mod
-    if mod is None:
-        return False, None
-    if isinstance(exc, getattr(mod, "RateLimitError", tuple())):
+    mod = anthropic if LLM_PROVIDER == "anthropic" else openai
+    if isinstance(exc, mod.RateLimitError):
         return True, 429
-    if isinstance(exc, (
-        getattr(mod, "APIConnectionError", tuple()),
-        getattr(mod, "APITimeoutError", tuple()),
-    )):
+    if isinstance(exc, (mod.APIConnectionError, mod.APITimeoutError)):
         return True, None
-    if isinstance(exc, getattr(mod, "APIStatusError", tuple())):
+    if isinstance(exc, mod.APIStatusError):
         status = getattr(exc, "status_code", None)
         return (bool(status and 500 <= status < 600), status)
     return False, None
@@ -1413,7 +1897,7 @@ def make_diverse_prompts(item: dict, n: int) -> list[tuple[str, str, float]]:
             p = build_kg_prompt(item, style=style, shuffled=triples_view)
             prompts.append((p, f"kg-{style}-t{temp}", temp))
     elif tt == "multi_hop_qa":
-        ranked = [c for _, c in rank_passages(item["question"], item["contexts"])] if ENABLE_PASSAGE_RANK else list(item["contexts"])
+        ranked = [c for _, c in rank_passages(item["question"], item["contexts"], item_id=item["id"])] if ENABLE_PASSAGE_RANK else list(item["contexts"])
         for k in range(n):
             style = styles_pool[k % len(styles_pool)]
             temp = temps_pool[k % len(temps_pool)]
@@ -1425,6 +1909,7 @@ def make_diverse_prompts(item: dict, n: int) -> list[tuple[str, str, float]]:
                 rng2.shuffle(view)
             p = build_mhqa_prompt(item, style=style, ranked=view)
             prompts.append((p, f"mhqa-{style}-t{temp}", temp))
+        # decomposition 路径在 make_diverse_prompts 之外异步注入（见 call_with_voting）
     else:
         for k in range(n):
             style = styles_pool[k % len(styles_pool)]
@@ -1434,20 +1919,60 @@ def make_diverse_prompts(item: dict, n: int) -> list[tuple[str, str, float]]:
     return prompts
 
 
+async def _multi_hop_decomposed_call(item: dict, thinking_budget: int) -> tuple[str, str]:
+    """先分解 -> 每个子问题独立检索 -> 用合并后的 contexts 跑一条 cot 路径。返回 (answer, label)。"""
+    if not ENABLE_DECOMPOSE:
+        return "", "mhqa-decompose-disabled"
+    try:
+        ranked = await decompose_and_retrieve(item)
+        if not ranked:
+            return "", "mhqa-decompose-empty"
+        p = build_mhqa_prompt(item, style="cot", ranked=ranked)
+        ans = await call_api_once(p, item["id"], thinking_budget=thinking_budget, label="mhqa-decompose")
+        return ans, "mhqa-decompose-t0.3"
+    except Exception as e:
+        print(f"  [id={item['id']}] decompose path failed: {type(e).__name__}: {e}")
+        return "", "mhqa-decompose-err"
+
+
 async def call_with_voting(item: dict) -> str:
     n = VOTING_ROUNDS_BY_TYPE.get(item["task_type"], 3)
     thinking_budget = THINKING_BUDGET_BY_TYPE.get(item["task_type"], 10000)
     prompts = make_diverse_prompts(item, n)
-    results = await asyncio.gather(
-        *(
-            call_api_once(p, item["id"], thinking_budget=thinking_budget, label=label)
-            for p, label, _ in prompts
-        )
-    )
+
+    coros: list = [
+        call_api_once(p, item["id"], thinking_budget=thinking_budget, label=label)
+        for p, label, _ in prompts
+    ]
+    labels: list[str] = [lbl for _, lbl, _ in prompts]
+
+    # multi_hop_qa：再追加一条分解路径；显式记录其在 coros 中的位置
+    decompose_idx: int | None = None
+    if item["task_type"] == "multi_hop_qa" and ENABLE_DECOMPOSE:
+        decompose_idx = len(coros)
+        coros.append(_multi_hop_decomposed_call(item, thinking_budget))
+        labels.append("mhqa-decompose")
+
+    raw_results = await asyncio.gather(*coros)
+    results: list[str] = []
+    for i, r in enumerate(raw_results):
+        if i == decompose_idx and isinstance(r, tuple):
+            ans, lbl = r
+            results.append(ans)
+            labels[i] = lbl   # 用真实 label 覆盖占位
+        elif isinstance(r, tuple):
+            # 不应发生：常规路径返回 str
+            results.append(r[0])
+        else:
+            results.append(r)
+
     atype = detect_answer_type(item["question"])
     candidates = [coerce_answer(r, atype) for r in results]
-    chosen = majority_vote(candidates, atype)
-    if n > 1:
+    if ENABLE_WEIGHTED_VOTING:
+        chosen = weighted_majority_vote(candidates, labels, atype)
+    else:
+        chosen = majority_vote(candidates, atype)
+    if len(candidates) > 1:
         print(f"  [id={item['id']}] votes: {[c[:30] for c in candidates]} -> {chosen[:40]}")
     return chosen
 
@@ -1463,7 +1988,7 @@ def build_verify_prompt(item: dict, candidate: str) -> str:
             triples_list = extract_subgraph(triples_list, item["question"])
         ctx = "Triples:\n" + format_kg_triples_grouped(triples_list)
     elif tt == "multi_hop_qa":
-        ranked = [c for _, c in rank_passages(item["question"], item["contexts"])] if ENABLE_PASSAGE_RANK else item["contexts"]
+        ranked = [c for _, c in rank_passages(item["question"], item["contexts"], item_id=item["id"])] if ENABLE_PASSAGE_RANK else item["contexts"]
         ctx_text = ""
         for i, c in enumerate(ranked):
             title = c.get("title", f"Context {i + 1}")
@@ -1546,23 +2071,15 @@ async def repair_if_bad(item: dict, candidate: str) -> str:
 # ============================================================
 # Cross-run Consensus（跨运行答案投票 + 锁定 + 跳过）
 # ============================================================
-# 思路：每次脚本启动都会跑出一份 submit.jsonl。我们把历史每次跑的结果
-# 累计到 consensus_state.json；如果同一 id 在历史中有 >=N 次"归一化相等"
-# 的答案，就把它锁定（locked_answer），下次启动直接复用、跳过 API 调用，
-# 既省 token 又能用 wisdom-of-crowds 滤除随机抖动。
+# 思路：每次脚本启动跑出一份 submit.jsonl，累计到 consensus_state.json；
+# 同一 id 在历史中出现 >= CONSENSUS_LOCK_AT 次归一化相等的答案就锁定，
+# 下次启动直接复用 locked_answer 跳过 API 调用。
 # 输出：
-#   - submit.jsonl          —— 本次运行的完整答案（包含锁定 + 新生成）
+#   - submit.jsonl          —— 本次运行的完整答案（含锁定 + 新生成）
 #   - consensus_final.jsonl —— 仅锁定的答案（用于最终提交）
 #   - runs/run_<TS>_<P>.jsonl —— 历史每次提交的归档
 #   - consensus_state.json  —— 历史 + 锁定状态
-ENABLE_CONSENSUS = os.environ.get("ENABLE_CONSENSUS", "true").lower() == "true"
-RESET_CONSENSUS = os.environ.get("RESET_CONSENSUS", "false").lower() == "true"
-CONSENSUS_LOCK_AT = int(os.environ.get("CONSENSUS_LOCK_AT", "2"))  # 多少次相同就锁定
-CONSENSUS_STATE_FILE = "consensus_state.json"
-CONSENSUS_FINAL_FILE = "consensus_final.jsonl"
-CONSENSUS_RUNS_DIR = "runs"
-
-
+# 所有相关常量见文件顶部配置区。
 def _consensus_norm(answer: str, atype: AnswerType) -> str:
     """归一化用于比较的 key。先 coerce 再 normalize。"""
     if answer is None:
@@ -1750,54 +2267,80 @@ def write_submit(path: str, data: list, answers: dict) -> None:
 
 
 async def solve_item(item: dict) -> str:
-    # 1. Table 确定性求解
-    if item["task_type"] == "table_qa":
+    tt = item["task_type"]
+    atype = detect_answer_type(item["question"])
+
+    # === Table：先确定性，再 SQL 兜底，最后 pandas-code 兜底，全部不行才走 LLM 投票 ===
+    if tt == "table_qa":
         det = solve_table_qa(item)
         if det is not None and not is_bad_answer(det):
             return det
+        sql_ans = await solve_table_with_duckdb_sql(item)
+        if sql_ans and not is_bad_answer(sql_ans):
+            return coerce_answer(sql_ans, atype)
+        pd_ans = await solve_table_with_pandas_code(item)
+        if pd_ans and not is_bad_answer(pd_ans):
+            return coerce_answer(pd_ans, atype)
 
-    # 2. 自一致投票
+    # === KG：先投票；答案可疑时才启动 ToG（节省 token + 受 semaphore 约束）===
     candidate = await call_with_voting(item)
+    if tt == "knowledge_graph" and ENABLE_TOG:
+        if not candidate or is_bad_answer(candidate) or len(candidate.strip()) < 2:
+            tog_ans = await tog_iterative_explore(item)
+            if tog_ans and not is_bad_answer(tog_ans):
+                candidate = tog_ans
 
-    # 3. Verify-and-revise
+    # === Verifier + Repair + 类型后处理 ===
     candidate = await verify_and_revise(item, candidate)
-
-    # 4. 拒答兜底
     candidate = await repair_if_bad(item, candidate)
-
-    # 5. 类型后处理
-    atype = detect_answer_type(item["question"])
     candidate = coerce_answer(candidate, atype)
     return candidate
 
 
-async def worker(sem, item, out_lock, out_file, counter, total, consensus_state=None):
+async def worker(
+    sems: dict[str, asyncio.Semaphore],
+    default_sem: asyncio.Semaphore,
+    item: dict,
+    out_lock: asyncio.Lock,
+    out_file,
+    counter: dict,
+    total: int,
+    pbar,
+    consensus_state: dict | None = None,
+) -> None:
+    """按题型从对应 semaphore 限流；写出 JSONL + 更新进度条 + 喂入 consensus。"""
+    sem = sems.get(item["task_type"], default_sem)
     async with sem:
         try:
             answer = await solve_item(item)
         except Exception as e:
             print(f"  [id={item['id']}] solve_item failed: {type(e).__name__}: {e}")
             answer = ""
+        # 释放 per-item 缓存
+        _RANK_CACHE.clear()
         async with out_lock:
             out_file.write(json.dumps({"id": item["id"], "answer": answer}, ensure_ascii=False) + "\n")
             out_file.flush()
             counter["done"] += 1
             preview = (item["question"][:50] + "...") if len(item["question"]) > 50 else item["question"]
             ans_preview = (answer[:60] + "...") if len(answer) > 60 else answer
-            print(f"[{counter['done']:3d}/{total}] id={item['id']:3d} {item['task_type']:16s} | Q: {preview}")
-            print(f"            -> {ans_preview!r}")
+            pbar.update(1)
+            pbar.set_postfix_str(f"id={item['id']:>3} {item['task_type']:>16}", refresh=True)
+            pbar.write(f"[{counter['done']:3d}/{total}] id={item['id']:3d} {item['task_type']:16s} | Q: {preview} -> {ans_preview!r}")
             # 共识状态更新（同样在锁内，避免并发写文件冲突）
             if consensus_state is not None and answer:
                 atype = detect_answer_type(item["question"])
                 if record_answer_to_state(consensus_state, item["id"], answer, atype, persist=True):
-                    print(f"            *** consensus LOCKED for id={item['id']} -> "
-                          f"{consensus_state[str(item['id'])]['locked_answer'][:60]!r}")
+                    pbar.write(
+                        f"*** consensus LOCKED for id={item['id']} -> "
+                        f"{consensus_state[str(item['id'])]['locked_answer'][:60]!r}"
+                    )
 
 
 async def main():
     _ensure_provider_modules()
-    print("=" * 60)
-    print(f"CCKS 2026 OneEval v2  |  provider={LLM_PROVIDER}")
+    print("=" * 70)
+    print(f"CCKS 2026 OneEval v3  |  provider={LLM_PROVIDER}")
     if LLM_PROVIDER == "anthropic":
         print(f"  model={ANTHROPIC_MODEL}  base={ANTHROPIC_BASE_URL}")
         print(f"  THINKING_BUDGET: {THINKING_BUDGET_BY_TYPE}")
@@ -1805,8 +2348,11 @@ async def main():
         print(f"  model={OPENAI_MODEL}  base={OPENAI_BASE_URL}  reasoning_effort={OPENAI_REASONING_EFFORT}")
     print(f"  VOTING_ROUNDS:   {VOTING_ROUNDS_BY_TYPE}")
     print(f"  KG_SUBGRAPH={ENABLE_KG_SUBGRAPH}  PASSAGE_RANK={ENABLE_PASSAGE_RANK}  VERIFY={ENABLE_VERIFICATION}  REPAIR={ENABLE_REPAIR}")
+    print(f"  DENSE: GPU={DENSE_MODEL_GPU}  CPU={DENSE_MODEL_CPU}  CROSS_GRAN={ENABLE_CROSS_GRANULARITY}")
+    print(f"  TOG={ENABLE_TOG}  DECOMPOSE={ENABLE_DECOMPOSE}  TABLE_SQL={ENABLE_TABLE_SQL}  TABLE_PANDAS={ENABLE_TABLE_PANDAS_CODE}")
+    print(f"  WEIGHTED_VOTING={ENABLE_WEIGHTED_VOTING}  PER_TYPE_CONCURRENCY={CONCURRENCY_BY_TYPE}")
     print(f"  CONSENSUS={ENABLE_CONSENSUS}  lock_at={CONSENSUS_LOCK_AT}  reset={RESET_CONSENSUS}")
-    print("=" * 60)
+    print("=" * 70)
 
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -1864,20 +2410,38 @@ async def main():
         if item["id"] in answers and answers[item["id"]] and (not REANSWER_BAD or not is_bad_answer(answers[item["id"]]))
     }
     todo = [d for d in data if d["id"] not in done_ids]
-    print(f"已完成: {len(done_ids)}  |  待答: {len(todo)}  |  并发: {CONCURRENCY}")
+    print(f"已完成: {len(done_ids)}  |  待答: {len(todo)}  |  per-type 并发: {CONCURRENCY_BY_TYPE}")
     print(f"表格确定性求解覆盖: {deterministic_count}")
 
     if todo:
-        sem = asyncio.Semaphore(CONCURRENCY)
+        sems = {tt: asyncio.Semaphore(c) for tt, c in CONCURRENCY_BY_TYPE.items()}
+        # 题型不在配置里时使用此默认（用最小并发，更稳）
+        default_sem = asyncio.Semaphore(min(CONCURRENCY_BY_TYPE.values()))
         out_lock = asyncio.Lock()
         counter = {"done": 0}
-        with open(RAW_OUTPUT_FILE, "a", encoding="utf-8") as out_file:
-            tasks = [
-                worker(sem, item, out_lock, out_file, counter, len(todo),
-                       consensus_state if ENABLE_CONSENSUS else None)
-                for item in todo
-            ]
-            await asyncio.gather(*tasks)
+        pbar = tqdm(
+            total=len(todo),
+            desc=f"CCKS-{LLM_PROVIDER}",
+            dynamic_ncols=True,
+            mininterval=0.2,
+            smoothing=0.1,
+            position=0,
+            leave=True,
+        )
+        try:
+            with open(RAW_OUTPUT_FILE, "a", encoding="utf-8") as out_file:
+                tasks = [
+                    worker(
+                        sems, default_sem, item, out_lock, out_file, counter,
+                        len(todo), pbar,
+                        consensus_state if ENABLE_CONSENSUS else None,
+                    )
+                    for item in todo
+                ]
+                await asyncio.gather(*tasks)
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         answers.update(load_answers(RAW_OUTPUT_FILE))
         for item in data:
