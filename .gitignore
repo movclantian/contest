@@ -2,3 +2,6 @@ submit.jsonl
 submit.zip
 *.pyc
 submit_raw.jsonl
+consensus_state.json
+consensus_final.jsonl
+runs/
