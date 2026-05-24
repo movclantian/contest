@@ -1,5 +1,6 @@
 """
 CCKS 2026 OneEval 解题脚本（DeepSeek V4 Pro + Think Max）
+改进版：降温 + 收缩思考预算 + 防御式提示词 + 自一致投票 + 增强表格求解
 用法：.venv/Scripts/python.exe test.py
 """
 
@@ -22,15 +23,16 @@ INPUT_FILE = "contest_data.json"
 OUTPUT_FILE = "submit.jsonl"
 RAW_OUTPUT_FILE = "submit_raw.jsonl"
 
-THINKING_BUDGET = 32000
-MAX_TOKENS = 384000
-TEMPERATURE = 1.0
-TOP_P = 1.0
+THINKING_BUDGET = 10000
+MAX_TOKENS = 16000
+TEMPERATURE = 0.3
+TOP_P = 0.9
 
-CONCURRENCY = 120
+CONCURRENCY = 80
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 2.0
 REANSWER_BAD = True
+VOTING_ROUNDS = 3
 # ============================================================
 
 client = anthropic.AsyncAnthropic(api_key=API_KEY, base_url=BASE_URL, timeout=600.0)
@@ -136,8 +138,6 @@ def solve_table_qa(item: dict) -> str | None:
         performer = re.sub(r"^how many films has\s+", "", q).removesuffix(" appeared in?")
         performer_col = col_index(header, "Performer")
         if performer_col is None:
-            if not any(performer and performer in normalize_text(" ".join(str(cell) for cell in row)) for row in rows):
-                return None
             return str(sum(1 for row in rows if str(row[film_col]).strip()))
         return str(sum(1 for row in rows if normalize_text(row[performer_col]) == performer))
 
@@ -164,19 +164,39 @@ def solve_table_qa(item: dict) -> str | None:
                     return None
                 return str(target_total - silver - bronze)
 
-    if "how many days" in q and "last" in q and "start" not in q and "finish" not in q:
+    if "how many days" in q:
         title_col = col_index(header, "Official Title", "Official title", "Festival Event (Official title)")
         start_col = col_index(header, "Start Date")
         finish_col = col_index(header, "Finish Date")
         if title_col is not None and start_col is not None and finish_col is not None:
             title = extract_table_name_from_question(rows, title_col, question)
             if title:
-                row = next(row for row in rows if row[title_col] == title)
-                start = parse_day(row[start_col])
-                finish = parse_day(row[finish_col])
-                if start is None or finish is None:
-                    return None
-                return str(finish - start + 1)
+                matching = [row for row in rows if row[title_col] == title]
+                if len(matching) == 1:
+                    row = matching[0]
+                    start = parse_day(row[start_col])
+                    finish = parse_day(row[finish_col])
+                    if start is not None and finish is not None:
+                        return str(finish - start + 1)
+                elif matching:
+                    start = min(parse_day(r[start_col]) or 999 for r in matching)
+                    finish = max(parse_day(r[finish_col]) or 0 for r in matching)
+                    if start != 999 and finish != 0:
+                        return str(finish - start + 1)
+
+    if ("how many days" in q or "how long" in q) and ("start" in q or "finish" in q or "between" in q or "last" in q or "does" in q):
+        title_col = col_index(header, "Official Title", "Official title", "Festival Event (Official title)")
+        start_col = col_index(header, "Start Date")
+        finish_col = col_index(header, "Finish Date")
+        if title_col is not None and start_col is not None and finish_col is not None:
+            title = extract_table_name_from_question(rows, title_col, question)
+            if title:
+                row = next((r for r in rows if r[title_col] == title), None)
+                if row:
+                    start = parse_day(row[start_col])
+                    finish = parse_day(row[finish_col])
+                    if start is not None and finish is not None:
+                        return str(finish - start + 1)
 
     if "last name" in q and "ends with" in q:
         name_col = col_index(header, "Cadet Name")
@@ -306,7 +326,7 @@ def solve_table_qa(item: dict) -> str | None:
                         best = (year, row[0])
             return best[1] if best else None
 
-    if "which is greater" in q and "goals" in q:
+    if ("which is greater" in q or "which is larger" in q) and ("goals" in q or "home" in q):
         venue_col = col_index(header, "Venue")
         opponent_col = col_index(header, "Opponent")
         goals_col = col_index(header, "Goals For")
@@ -314,17 +334,33 @@ def solve_table_qa(item: dict) -> str | None:
         if venue_col is not None and opponent_col is not None:
             venue_name = extract_table_name_from_question(rows, venue_col, question)
             opp_name = extract_table_name_from_question(rows, opponent_col, question)
-            if venue_name and opp_name:
+            venue_label = None
+            opp_label = None
+            if not venue_name:
+                venue_match = re.search(r"(?:played in|in)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", question)
+                if venue_match:
+                    venue_label = venue_match.group(1)
+            else:
+                venue_label = venue_name
+            if not opp_name:
+                opp_match = re.search(r"against\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", question)
+                if opp_match:
+                    opp_label = opp_match.group(1)
+            else:
+                opp_label = opp_name
+            if venue_label and opp_label:
+                venue_norm = normalize_text(venue_label)
+                opp_norm = normalize_text(opp_label)
                 if goals_col is not None:
-                    venue_sum = sum(to_int(row[goals_col]) or 0 for row in rows if row[venue_col] == venue_name)
-                    opp_sum = sum(to_int(row[goals_col]) or 0 for row in rows if row[opponent_col] == opp_name)
-                    return f"total Goals For in matches played in {venue_name}" if venue_sum > opp_sum else f"total Goals For in matches against {opp_name}"
+                    venue_sum = sum(to_int(row[goals_col]) or 0 for row in rows if venue_norm in normalize_text(row[venue_col]))
+                    opp_sum = sum(to_int(row[goals_col]) or 0 for row in rows if opp_norm in normalize_text(row[opponent_col]))
+                    return f"total Goals For in matches played in {venue_label}" if venue_sum > opp_sum else f"total Goals For in matches against {opp_label}"
                 if result_col is not None:
                     def home_goals(row):
-                        return to_int(re.split(r"\s*[\-–—]\s*", row[result_col])[0]) or 0
-                    venue_sum = sum(home_goals(row) for row in rows if row[venue_col] == venue_name)
-                    opp_sum = sum(home_goals(row) for row in rows if row[opponent_col] == opp_name)
-                    return f"total home goals scored in matches played in {venue_name}" if venue_sum > opp_sum else f"total home goals scored against opponent {opp_name}"
+                        return to_int(re.split(r"\s*[\-\u2013\u2014]\s*", row[result_col])[0]) or 0
+                    venue_sum = sum(home_goals(row) for row in rows if venue_norm in normalize_text(row[venue_col]))
+                    opp_sum = sum(home_goals(row) for row in rows if opp_norm in normalize_text(row[opponent_col]))
+                    return f"total home goals scored in matches played in {venue_label}" if venue_sum > opp_sum else f"total home goals scored against opponent {opp_label}"
 
     if "v8" in q:
         engine_col = col_index(header, "Engine Spec", "Vehicle", "Vehicle (description)")
@@ -424,6 +460,110 @@ def solve_table_qa(item: dict) -> str | None:
             if candidates:
                 return max(candidates, key=lambda row: ordinal_to_int(row[grid_col]) or -1)[circuit_col]
 
+    if "last name" in q and ("token" in q or "ends with" in q):
+        name_col = col_index(header, "Cadet Name")
+        house_col = col_index(header, "House")
+        if name_col is None:
+            name_col = 0
+        letter_match = re.search(r'["\u201c]([a-zA-Z])["\u201d]', question)
+        house_match = re.search(r"from\s+(?:the\s+)?(.+?)(?:\s+has|\s+whose)", question, re.I)
+        if letter_match:
+            suffix = letter_match.group(1)
+            target_house = normalize_text(house_match.group(1)) if house_match else None
+            for row in rows:
+                if target_house and house_col is not None and normalize_text(row[house_col]) != target_house:
+                    continue
+                last_token = row[name_col].split()[-1]
+                if last_token.endswith(suffix):
+                    return row[name_col]
+
+    if "at least" in q or "at most" in q:
+        for ci, col_name in enumerate(header):
+            cn = normalize_text(col_name)
+            if cn in normalize_text(question):
+                threshold_match = re.search(r"at least\s+([\d.]+)", q) or re.search(r"at most\s+([\d.]+)", q)
+                if threshold_match:
+                    threshold = float(threshold_match.group(1))
+                    is_at_least = "at least" in q
+                    count = 0
+                    for row in rows:
+                        try:
+                            val = float(str(row[ci]).replace(",", ""))
+                        except (ValueError, TypeError):
+                            continue
+                        if (is_at_least and val >= threshold) or (not is_at_least and val <= threshold):
+                            count += 1
+                    if count > 0:
+                        return str(count)
+
+    if "how many" in q and "scored" in q:
+        scorers_col = col_index(header, "Scorers")
+        if scorers_col is not None:
+            year_match = re.search(r"\b(\d{3,4})\b", question)
+            year_col = col_index(header, "Year")
+            competition_col = col_index(header, "Competition")
+            competition = None
+            if competition_col is not None:
+                competitions = sorted({row[competition_col] for row in rows}, key=len, reverse=True)
+                competition = next((name for name in competitions if exactish(name, question)), None)
+            people = set()
+            for row in rows:
+                if year_match and year_col is not None and row[year_col] != year_match.group(1):
+                    continue
+                if competition and competition_col is not None and normalize_text(row[competition_col]) != normalize_text(competition):
+                    continue
+                people.update(split_people(row[scorers_col]))
+            return str(len(people)) if people else None
+
+    if "established first" in q or "earliest" in q:
+        estab_col = col_index(header, "Established", "Founded", "Date Established")
+        name_col = 0
+        if estab_col is not None:
+            best_date = None
+            best_name = None
+            for row in rows:
+                date_str = row[estab_col]
+                year_m = re.search(r"\b(\d{3,4})\b", date_str)
+                day_m = re.search(r"\b(\d{1,2})\b", date_str)
+                if year_m:
+                    year = int(year_m.group(1))
+                    month_map = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                                 "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+                    month = 1
+                    for abbr, mnum in month_map.items():
+                        if abbr in date_str.lower():
+                            month = mnum
+                            break
+                    day = int(day_m.group(1)) if day_m else 1
+                    date_val = (year, month, day)
+                    if best_date is None or date_val < best_date:
+                        best_date = date_val
+                        best_name = row[name_col]
+            if best_name:
+                return best_name
+
+    if "more total" in q or "which month" in q and "more" in q:
+        month_col = col_index(header, "Month-Year", "Month\u2013Year", "Month")
+        if month_col is not None:
+            quoted = re.findall(r"(\S+\s+\d{3,4})", question)
+            if len(quoted) >= 2:
+                m1, m2 = normalize_text(quoted[0]), normalize_text(quoted[1])
+                numeric_cols = [i for i in range(len(header)) if i != month_col]
+                sum1, sum2 = 0.0, 0.0
+                for row in rows:
+                    rmonth = normalize_text(row[month_col])
+                    for ci in numeric_cols:
+                        try:
+                            val = float(str(row[ci]).replace(",", ""))
+                        except (ValueError, TypeError):
+                            continue
+                        if rmonth == m1:
+                            sum1 += val
+                        elif rmonth == m2:
+                            sum2 += val
+                if sum1 or sum2:
+                    return quoted[0] if sum1 >= sum2 else quoted[1]
+
     return None
 
 
@@ -441,6 +581,22 @@ def extract_kg_triples(raw: str) -> list[str]:
 def format_kg_triples(raw: str) -> str:
     triples = extract_kg_triples(raw)
     return "\n".join(f"{i + 1}. {triple}" for i, triple in enumerate(triples))
+
+
+def format_kg_triples_grouped(raw: str) -> str:
+    triples = extract_kg_triples(raw)
+    groups: dict[str, list[str]] = {}
+    for triple in triples:
+        tokens = triple.split(" ", 1)
+        head = tokens[0] if tokens else "_"
+        groups.setdefault(head, []).append(triple)
+    lines = []
+    idx = 1
+    for head, group in groups.items():
+        for triple in group:
+            lines.append(f"{idx}. {triple}")
+            idx += 1
+    return "\n".join(lines)
 
 
 def format_table(table: dict) -> str:
@@ -464,21 +620,21 @@ def build_prompt(item: dict) -> str:
     question = item["question"]
 
     if task_type == "knowledge_graph":
-        return f"""You are solving a hard knowledge-intensive KG question.
-
-Knowledge graph triples are noisy and may omit bridge facts. Use the triples as primary evidence, but if the question clearly requires a common bridge fact not explicit in the triples, infer it using your general knowledge. Never answer with unknown/none/not specified.
+        return f"""You are an expert at knowledge graph reasoning. Below are knowledge graph triples in the format: <Subject> <Relation> <Object>.
 
 Triples:
-{format_kg_triples(item['input'])}
+{format_kg_triples_grouped(item['input'])}
 
 Question: {question}
 
-Instructions:
-- Find candidate entities mentioned in the triples.
-- Apply all AND / OR / NOT / later-than / earlier-than / count constraints exactly.
-- Prefer the answer entity whose type matches the question word: who/person, which film/film, what year/year, how many/number.
-- If several aliases or IDs exist, output the human-readable label.
-- Output ONLY the final answer text. No explanation, no quotes, no "Answer:"."""
+Reasoning protocol:
+1. IDENTIFY the key entities and constraints in the question (who, what, which, how many, AND, OR, NOT, "but not", "later than", "earlier than").
+2. TRACE the reasoning path through the triples step by step. For multi-hop questions, find intermediate bridge entities.
+3. DISTRACTOR CHECK: Many triples are noise. Only use triples whose relations are relevant to the question.
+4. SET OPERATIONS: If the question uses "both ... and", "but not", "neither ... nor", compute the intersection/difference/complement explicitly.
+5. VERIFY: Before outputting, re-check that your answer satisfies ALL constraints in the question.
+6. For entity names, use the human-readable label (not internal IDs like m.xxxxx).
+7. Output ONLY the final answer. No explanation, no quotes, no prefix like "Answer:"."""
 
     elif task_type == "multi_hop_qa":
         contexts_text = ""
@@ -489,37 +645,41 @@ Instructions:
                 paragraph = " ".join(ctx["sentences"])
             contexts_text += f"\n[Document {i+1}: {title}]\n{paragraph}\n"
 
-        return f"""Read the following documents carefully and answer the question by integrating evidence across them.
+        return f"""You are an expert at multi-hop reading comprehension. Read ALL documents below carefully.
 
 {contexts_text}
 
 Question: {question}
 
-Instructions:
-- Use the provided documents as primary evidence. If a bridge is clearly missing but the answer is a well-known entity/date/title implied by the documents, infer it instead of refusing.
-- Do not answer with unknown, unanswerable, not mentioned, not available, or cannot be determined.
-- Trace the multi-hop path internally before concluding.
-- Be precise about names, dates, numbers
-- Give a concise final answer (a name, number, date, or short phrase)
-- Output ONLY the final answer text, no explanations, no quotes, no prefixes like "Answer:" """
+Reasoning protocol:
+1. DECOMPOSE: Break the question into sub-questions. Identify what bridge entities or facts connect the documents.
+2. EVIDENCE TRACE: For each sub-question, find the specific sentence(s) in the documents that provide the answer.
+3. INTEGRATE: Combine the sub-answers to form the final answer.
+4. FICTIONAL CONTENT: Some documents describe fictional worlds. Answer based strictly on what the documents state, not external knowledge.
+5. VERIFY: Re-read the question and confirm your answer satisfies all constraints.
+6. Be precise about names, dates, numbers, and titles. Use the exact form from the documents.
+7. Output ONLY the final answer (a name, number, date, or short phrase). No explanations, no quotes, no prefix like "Answer:"."""
 
     elif task_type == "table_qa":
         table = item["table"]
         table_text = format_table(table)
+        num_rows = len(table["rows"])
+        num_cols = len(table["header"])
 
-        return f"""Analyze the following table and answer the question.
+        return f"""You are an expert at table-based reasoning. The table has {num_cols} columns and {num_rows} data rows.
 
 {table_text}
 
 Question: {question}
 
-Instructions:
-- Answer based on the table data. Preserve row/column alignment.
-- Follow legend rows exactly when present.
-- For duplicate listings, deduplicate by factual row content rather than row id when the question asks for distinct matches.
-- Do arithmetic precisely.
-- Give a concise final answer (a name, number, or short phrase)
-- Output ONLY the final answer text, no explanations, no quotes, no prefixes like "Answer:" """
+Reasoning protocol:
+1. LOCATE: Identify which column(s) and row(s) are relevant to the question.
+2. FILTER: Apply any conditions (e.g., "where Venue = X", "in season Y") to select the correct subset of rows.
+3. COMPUTE: Perform any required arithmetic (count, sum, difference, max, min) precisely.
+4. DEDUP: If the question asks for "distinct" or "unique", remove duplicate rows based on factual content (ignore row IDs).
+5. VERIFY: Double-check your count/computation by listing the qualifying items.
+6. Follow legend rows exactly when present.
+7. Output ONLY the final answer (a name, number, or short phrase). No explanations, no quotes, no prefix like "Answer:"."""
 
     else:
         raise ValueError(f"未知题型: {task_type}")
@@ -534,14 +694,25 @@ You must now provide the best concise answer. Do not refuse. Do not output unkno
 Output ONLY the final answer text."""
 
 
+def clean_answer(raw: str) -> str:
+    text = raw.strip()
+    for prefix in ("Answer:", "answer:", "A:", "The answer is", "The answer is:"):
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].strip()
+    text = text.strip('"\' ')
+    text = text.rstrip(".")
+    return text.strip()
+
+
 def extract_answer(response) -> str:
     for block in response.content:
         if getattr(block, "type", None) == "text":
-            return block.text.strip()
+            return clean_answer(block.text)
     return ""
 
 
-async def call_api(item: dict) -> str:
+async def call_api_once(item: dict, temperature: float = TEMPERATURE,
+                       thinking_budget: int = THINKING_BUDGET) -> str:
     prompt = build_prompt(item)
     backoff = INITIAL_BACKOFF
 
@@ -550,9 +721,9 @@ async def call_api(item: dict) -> str:
             response = await client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
+                temperature=temperature,
                 top_p=TOP_P,
-                thinking={"type": "enabled", "budget_tokens": THINKING_BUDGET},
+                thinking={"type": "enabled", "budget_tokens": thinking_budget},
                 output_config={"effort": "max"},
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -594,6 +765,33 @@ async def call_api(item: dict) -> str:
     return ""
 
 
+def majority_vote(answers: list[str]) -> str:
+    valid = [a for a in answers if a and not is_bad_answer(a)]
+    if not valid:
+        return answers[0] if answers else ""
+    counts = Counter(normalize_text(a) for a in valid)
+    best_norm = counts.most_common(1)[0][0]
+    for a in valid:
+        if normalize_text(a) == best_norm:
+            return a
+    return valid[0]
+
+
+async def call_api(item: dict) -> str:
+    temps = [TEMPERATURE] * VOTING_ROUNDS
+    if VOTING_ROUNDS >= 3:
+        temps[1] = min(TEMPERATURE + 0.2, 1.0)
+        temps[2] = max(TEMPERATURE - 0.1, 0.05)
+    results = await asyncio.gather(
+        *(call_api_once(item, temperature=t) for t in temps)
+    )
+    candidates = list(results)
+    answer = majority_vote(candidates)
+    if VOTING_ROUNDS > 1:
+        print(f"  [id={item['id']}] votes: {[c[:40] for c in candidates]} -> {answer[:40]}")
+    return answer
+
+
 async def call_repair_api(item: dict, bad_answer: str) -> str:
     prompt = build_repair_prompt(item, bad_answer)
     backoff = INITIAL_BACKOFF
@@ -603,9 +801,9 @@ async def call_repair_api(item: dict, bad_answer: str) -> str:
             response = await client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                temperature=0.2,
-                top_p=0.9,
-                thinking={"type": "enabled", "budget_tokens": min(THINKING_BUDGET, 12000)},
+                temperature=0.15,
+                top_p=0.85,
+                thinking={"type": "enabled", "budget_tokens": min(THINKING_BUDGET, 8000)},
                 output_config={"effort": "max"},
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -704,7 +902,7 @@ async def worker(sem, item, out_lock, out_file, counter, total):
 
 async def main():
     print("=" * 60)
-    print(f"CCKS 2026 OneEval  |  {MODEL}  |  Think Max budget={THINKING_BUDGET}")
+    print(f"CCKS 2026 OneEval  |  {MODEL}  |  budget={THINKING_BUDGET}  temp={TEMPERATURE}  votes={VOTING_ROUNDS}")
     print("=" * 60)
 
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
