@@ -1,0 +1,4 @@
+{
+  "progress": 60,
+  "update_time": "$(date +%Y-%m-%d %H:%M:%S)"
+}
