@@ -1,0 +1,29 @@
+name: Model Progress Sync
+# 触发条件：main分支推送、手动运行
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # 报错提示的 job 名称：generate-model-progress，必须和工具读取名称完全一致
+  generate-model-progress:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 生成 model-design-progress.json
+        run: |
+          echo '{
+            "progress": 60,
+            "update_time": "$(date +%Y-%m-%d %H:%M:%S)"
+          }' > model-design-progress.json
+
+      - name: 提交更新文件
+        run: |
+          git config --global user.name "Github Bot"
+          git config --global user.email "bot@github.com"
+          git add model-design-progress.json
+          git commit -m "自动更新模型进度文件"
+          git push
